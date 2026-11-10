@@ -368,7 +368,8 @@ static void refresh_download(CfgDlg*d){
    EnableWindow(d->ocrDownload,FALSE);
    SendMessageW(d->ocrProgress,PBM_SETPOS,100,0);
   }else{
-   SetWindowTextW(d->ocrStatus,ppocr_component_status_text().c_str());
+   SetWindowTextW(d->ocrStatus,state.text.empty()
+       ? ppocr_component_status_text().c_str() : state.text.c_str());
    SetWindowTextW(d->ocrDownload,L"下载 OCR 组件和 PP 模型");
    EnableWindow(d->ocrDownload,TRUE);
    SendMessageW(d->ocrProgress,PBM_SETPOS,0,0);
