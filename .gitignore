@@ -1,0 +1,39 @@
+# ---- 构建产物 ----
+build/
+cpp/build/
+Release/.build/
+Release/Tests/
+Release/verification/
+Release/archives/
+Release/weijie/manifest.json
+Release/weijie/ocr-ncnn/
+runtime/ocr-ncnn/
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.lastbuildstate
+*.tlog
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 打包产物：只保留原生版，Python 单文件版太大 ----
+dist/*.exe
+!dist/微截.exe
+
+# ---- 本机数据 ----
+.workbuddy-ai/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
