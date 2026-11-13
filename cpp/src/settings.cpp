@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "ocr.h"
 
 const HotkeyPreset HOTKEY_PRESETS[9] = {
     {L"Alt+A",        MOD_ALT,                  0x41},
@@ -198,6 +199,13 @@ Settings load_settings() {
     if(!(v=get_json_str(js,"ocr_benchmark")).empty())s.ocr_benchmark=u8_to_w(v);
     s.text_size = std::clamp(get_json_int(js, "text_size", 18), 10, 72);
     s.ocr_enabled = get_json_bool(js, "ocr_enabled", s.ocr_enabled);
+    int idle=get_json_int(js,"ocr_idle_minutes",0);
+    if(std::find(std::begin(OCR_IDLE_TIMEOUT_MINUTES),std::end(OCR_IDLE_TIMEOUT_MINUTES),idle)
+       !=std::end(OCR_IDLE_TIMEOUT_MINUTES))s.ocr_idle_minutes=idle;
+    else{
+        LogTrace trace;
+        logf(L"读取设置：OCR 空闲回收分钟=%d 不在0/1/10/60/720/1440范围，使用off",idle);
+    }
     s.translate_enabled = get_json_bool(js, "translate_enabled", s.translate_enabled);
     if (!(v = get_json_str(js, "ocr_model_dir")).empty()) s.ocr_model_dir = u8_to_w(v);
     if (!(v = get_json_str(js, "llm_base")).empty())   s.llm_base = u8_to_w(v);
@@ -208,6 +216,16 @@ Settings load_settings() {
 }
 
 bool save_settings(const Settings& s) {
+    LogTrace trace;
+    logf(L"设置空闲回收校验：分钟=%d 允许=0/1/10/60/720/1440",s.ocr_idle_minutes);
+    if(std::find(std::begin(OCR_IDLE_TIMEOUT_MINUTES),std::end(OCR_IDLE_TIMEOUT_MINUTES),s.ocr_idle_minutes)
+       ==std::end(OCR_IDLE_TIMEOUT_MINUTES)){
+        logf(L"设置写入被拒绝：OCR 空闲回收时间不在下拉选项范围，未写入或应用设置");
+        return false;
+    }
+    bool previousOcrEnabled=load_settings().ocr_enabled;
+    logf(L"设置写入开始：文件=%s 保存目录=%s OCR启用=%d 引擎=%s",
+         settings_path().c_str(),s.save_dir.c_str(),(int)s.ocr_enabled,s.ocr_engine.c_str());
     std::string js = "{\n";
     js += "  \"recent_colors\": \"" + json_escape(w_to_u8(s.recent_colors)) + "\",\n";
     js += "  \"ocr_backend\": \"" + json_escape(w_to_u8(s.ocr_backend)) + "\",\n";
@@ -223,6 +241,7 @@ bool save_settings(const Settings& s) {
     js += "  \"stroke_width\": " + std::to_string(s.stroke_width) + ",\n";
     js += "  \"text_size\": " + std::to_string(s.text_size) + ",\n";
     js += "  \"ocr_enabled\": " + std::string(s.ocr_enabled ? "true" : "false") + ",\n";
+    js += "  \"ocr_idle_minutes\": " + std::to_string(s.ocr_idle_minutes) + ",\n";
     js += "  \"translate_enabled\": " + std::string(s.translate_enabled ? "true" : "false") + ",\n";
     js += "  \"ocr_model_dir\": \"" + json_escape(w_to_u8(s.ocr_model_dir)) + "\",\n";
     js += "  \"llm_base\": \"" + json_escape(w_to_u8(s.llm_base)) + "\",\n";
@@ -234,12 +253,25 @@ bool save_settings(const Settings& s) {
     std::wstring temp = path + L".tmp";
     HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        logf(L"设置写入失败：无法创建临时文件 error=%lu，原设置未改动",GetLastError());
+        return false;
+    }
     DWORD wrote = 0;
     bool ok = WriteFile(h, js.data(), (DWORD)js.size(), &wrote, nullptr) &&
               wrote == js.size() && FlushFileBuffers(h);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     CloseHandle(h);
     if (ok) ok = MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    if (!ok) DeleteFileW(temp.c_str());
+    if (!ok) {
+        if (!error) error=GetLastError();
+        DeleteFileW(temp.c_str());
+        logf(L"设置写入返回：失败 error=%lu 写入字节=%lu 预期字节=%zu，未应用设置",
+             error,wrote,js.size());
+    } else {
+        logf(L"设置写入返回：成功 字节=%lu 文件=%s",wrote,path.c_str());
+        if(!s.ocr_enabled||previousOcrEnabled!=s.ocr_enabled)ocr_set_enabled(s.ocr_enabled);
+        ocr_set_idle_timeout(s.ocr_idle_minutes);
+    }
     return ok;
 }

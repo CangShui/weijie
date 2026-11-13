@@ -1,5 +1,6 @@
 #include "fast_ocr.h"
 #include "settings.h"
+#include "ocr.h"
 
 #include <mutex>
 #include <vector>
@@ -104,13 +105,14 @@ void close_sidecar_locked() {
         WaitForSingleObject(g_process, 3000);
         CloseHandle(g_process);
     }
-    if (g_job) CloseHandle(g_job);
+    if (g_job) {ocr_forget_process(g_job);CloseHandle(g_job);}
     if (g_in) CloseHandle(g_in);
     if (g_out) CloseHandle(g_out);
     g_job = nullptr;
     g_process = nullptr;
     g_in = nullptr;
     g_out = nullptr;
+    g_initialized.store(false);
 }
 
 bool read_one(HANDLE h, char& c, DWORD timeout_ms, const std::atomic<bool>* cancel) {
@@ -179,6 +181,7 @@ bool write_all(HANDLE h, const char* data, size_t count) {
 }
 
 bool start_sidecar_locked(std::wstring& err) {
+    if(!ocr_is_enabled()){err=L"识别主开关已关闭，不加载模型";return false;}
     // Keep the compiled models and dynamic-shape kernels alive across captures.
     // Previously this unconditionally killed the worker before every request.
     if (g_process && g_in && g_out &&
@@ -191,7 +194,7 @@ bool start_sidecar_locked(std::wstring& err) {
     close_sidecar_locked();
     g_runtime_dir = find_runtime_dir();
     if (g_runtime_dir.empty()) {
-        err = L"缺少 PP-OCRv6 组件（ocr-ncnn / ocr-fast），请使用完整程序包";
+        err = L"OCR 组件未安装，请在设置的文字识别页下载 OCR 组件和 PP 模型";
         return false;
     }
 
@@ -245,6 +248,7 @@ bool start_sidecar_locked(std::wstring& err) {
     bool job_ok = job && SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                                                  &limits, sizeof(limits)) &&
                   AssignProcessToJobObject(job, pi.hProcess);
+    if (job_ok)job_ok=ocr_track_process(job,pi.hProcess);
     if (!job_ok) {
         TerminateProcess(pi.hProcess, 2);
         WaitForSingleObject(pi.hProcess, 3000);
@@ -253,7 +257,7 @@ bool start_sidecar_locked(std::wstring& err) {
         if (job) CloseHandle(job);
         CloseHandle(parent_write);
         CloseHandle(parent_read);
-        err = L"无法创建受控 OCR 进程";
+        err = ocr_is_enabled()?L"无法创建受控 OCR 进程":L"识别主开关已关闭，不加载模型";
         return false;
     }
     ResumeThread(pi.hThread);
@@ -266,7 +270,7 @@ bool start_sidecar_locked(std::wstring& err) {
     std::string ready;
     if (!read_line(g_out, ready, 60000, nullptr) || ready.rfind("READY", 0) != 0) {
         close_sidecar_locked();
-        err = L"OCR 引擎启动超时或初始化失败";
+        err = ocr_is_enabled()?L"OCR 引擎启动超时或初始化失败":L"识别主开关已关闭，模型已卸载";
         return false;
     }
     logf(L"PP-OCR sidecar ready pid=%lu: %s", GetProcessId(g_process), g_runtime_dir.c_str());
@@ -341,7 +345,7 @@ bool fast_ocr_initializing() {
 
 std::wstring fast_ocr_status_text() {
     if (find_runtime_dir().empty()) {
-        return L"缺少 PP-OCRv6 组件（ocr-ncnn / ocr-fast），请使用完整程序包";
+        return L"OCR 组件未安装，请在设置的文字识别页下载 OCR 组件和 PP 模型";
     }
     if (g_use_ncnn.load()) {
         return L"PP-OCRv6 · ncnn Vulkan 就绪；Intel / AMD / NVIDIA；无 Vulkan 回退 CPU。";
@@ -356,12 +360,19 @@ std::wstring fast_ocr_status_text() {
 
 bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& err,
                         const std::atomic<bool>* cancel) {
+    LogTrace trace;
+    OcrActivity activity;
     text.clear();
     err.clear();
     if (!bmp) { err = L"没有可识别的图像"; return false; }
+    if(!ocr_is_enabled()){err=L"识别主开关已关闭，不加载模型";logf(L"PP-OCR 请求被拒绝：主开关关闭");return false;}
     if (cancel && cancel->load()) { err = L"已取消识别"; return false; }
 
     std::lock_guard<std::mutex> guard(g_lock);
+    if(!ocr_is_enabled()||(cancel&&cancel->load())){
+        err=ocr_is_enabled()?L"已取消识别":L"识别主开关已关闭，不加载模型";
+        return false;
+    }
     if (!start_sidecar_locked(err)) return false;
 
     wchar_t temp[MAX_PATH]{}, unique[MAX_PATH]{};
@@ -397,7 +408,7 @@ bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& 
         bool cancelled = cancel && cancel->load();
         DeleteFileW(image.c_str());
         close_sidecar_locked();
-        err = cancelled ? L"已取消识别" : L"OCR 引擎响应超时";
+        err = !ocr_is_enabled()?L"识别主开关已关闭，模型已卸载":cancelled ? L"已取消识别" : L"OCR 引擎响应超时";
         return false;
     }
     size_t space = header.find(' ');
@@ -445,6 +456,11 @@ bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& 
         return false;
     }
 
+    if(!ocr_is_enabled()||(cancel&&cancel->load())){
+        close_sidecar_locked();
+        err=ocr_is_enabled()?L"已取消识别":L"识别主开关已关闭，模型已卸载";
+        return false;
+    }
     g_initialized.store(true);
     text = tidy(u8_to_w(payload));
     if (g_use_ncnn.load()) write_diag("request_end", g_sidecar_reused);
@@ -460,4 +476,34 @@ bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& 
 void fast_ocr_shutdown() {
     std::lock_guard<std::mutex> guard(g_lock);
     close_sidecar_locked();
+}
+
+bool ocr_reclaim_idle(ULONGLONG now){
+    // 与识别共用同一把锁：新请求可排队，但不能在检查与清理之间启动模型。
+    std::unique_lock<std::mutex> guard(g_lock,std::try_to_lock);
+    if(!guard.owns_lock()||!g_process)return false;
+    LogTrace trace;
+    if(!ocr_idle_expired(now))return false;
+    DWORD pid=GetProcessId(g_process);
+    HANDLE process=nullptr;
+    DuplicateHandle(GetCurrentProcess(),g_process,GetCurrentProcess(),&process,
+                    SYNCHRONIZE,FALSE,0);
+    logf(L"OCR 自动回收开始：pid=%lu，释放缓存模型和内存/显存，下次识别按需加载",pid);
+    close_sidecar_locked();
+    bool exited=process&&WaitForSingleObject(process,0)==WAIT_OBJECT_0;
+    if(process)CloseHandle(process);
+    logf(L"OCR 自动回收返回：pid=%lu 进程已退出=%d 主开关仍启用=%d",
+         pid,(int)exited,(int)ocr_is_enabled());
+    return exited;
+}
+
+void fast_ocr_unload(){
+    g_initialized.store(false);
+    std::unique_lock<std::mutex> guard(g_lock,std::try_to_lock);
+    if(guard.owns_lock()){
+        close_sidecar_locked();
+        logf(L"PP-OCR 模型缓存及进程句柄已清理");
+    }else{
+        logf(L"PP-OCR 模型进程已停止，识别线程结束时回收剩余句柄，不阻塞设置窗口");
+    }
 }

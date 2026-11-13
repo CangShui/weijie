@@ -1,9 +1,9 @@
 # Keep this file ASCII-only for Windows PowerShell 5.1 compatibility.
 [CmdletBinding()]
 param(
-    [ValidateSet('Build', 'Package', 'Test', 'All', 'Clean')]
+    [ValidateSet('Build', 'Package', 'Test', 'Deploy', 'All', 'Clean')]
     [string]$Task = 'Build',
-    [ValidateSet('Core', 'CPU', 'GPU', 'UI', 'All')]
+    [ValidateSet('Core', 'CPU', 'GPU', 'UI', 'Capture', 'Lifecycle', 'All')]
     [string]$Suite = 'Core',
     [string]$RuntimeSource = $env:JJ_RUNTIME_SOURCE,
     [string]$DocsSource = $env:JJ_DOCS_SOURCE,
@@ -15,6 +15,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($Task -eq 'All' -and -not $PSBoundParameters.ContainsKey('Suite')) { $Suite = 'All' }
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'images-layout.ps1')
 if (-not $RuntimeSource) {
     $localRuntime = Join-Path $Root 'runtime'
     if (Test-Path -LiteralPath $localRuntime) { $RuntimeSource = $localRuntime }
@@ -24,10 +25,10 @@ $App = Join-Path $Release 'weijie'
 $Intermediate = Join-Path $Release '.build'
 $Tests = Join-Path $Release 'Tests'
 $Reports = Join-Path $Release 'verification'
-$RuntimeNames = @('emoji')
-$AppSources = @('main', 'overlay', 'annotate', 'capture', 'longshot', 'ocr',
+$RuntimeNames = @('images')
+$AppSources = @('main', 'autostart', 'overlay', 'annotate', 'capture', 'desktop_duplication', 'longshot', 'ocr',
     'fast_ocr', 'style_popup', 'ocr_setup', 'ppocr_setup', 'translate', 'pin', 'output',
-    'settings', 'common', 'emoji_renderer', 'emoji_popup') |
+    'settings', 'common', 'emoji_renderer', 'emoji_popup', 'animated_image') |
     ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
 $Resource = Join-Path $Root 'cpp\src\app.rc'
 $ResourceText = Get-Content -LiteralPath $Resource -Raw -Encoding UTF8
@@ -36,7 +37,7 @@ if (-not $NameMatch.Success) { throw 'OriginalFilename missing in cpp/src/app.rc
 $AppExe = Join-Path $App $NameMatch.Groups[1].Value
 $CommonLibraries = @('user32.lib', 'gdi32.lib', 'gdiplus.lib', 'shell32.lib',
     'ole32.lib', 'winhttp.lib', 'dwmapi.lib', 'shcore.lib', 'windowsapp.lib',
-    'advapi32.lib', 'comdlg32.lib')
+    'advapi32.lib', 'comdlg32.lib', 'windowscodecs.lib')
 
 function Assert-InRelease([string]$Path) {
     $absolute = [IO.Path]::GetFullPath($Path)
@@ -155,8 +156,11 @@ function Compile-Target([string]$Name, [string[]]$Sources, [string]$Output,
     $flags = @('/nologo', '/std:c++20', '/EHa', '/O2', '/MT', '/utf-8', '/W3',
         '/DUNICODE', '/D_UNICODE', ("/Fo$objects\"), ("/Fd$objects\"))
     $subsystem = if ($Windows) { 'WINDOWS' } else { 'CONSOLE' }
+    $manifest = if ($Windows -and $WithResource) {
+        @('/MANIFEST:EMBED', "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
+    } else { @() }
     Invoke-Native 'cl.exe' ($flags + $inputs + @('/link',
-        "/SUBSYSTEM:$subsystem", "/OUT:$Output", ("/MAP:$objects\$Name.map")) + $CommonLibraries)
+        "/SUBSYSTEM:$subsystem", "/OUT:$Output", ("/MAP:$objects\$Name.map")) + $manifest + $CommonLibraries)
 }
 
 function Copy-Tree([string]$Source, [string]$Destination) {
@@ -200,6 +204,7 @@ function Write-Manifest {
         version = $version
         built = [DateTimeOffset]::Now.ToString('o')
         architecture = 'x64'
+        imagesLayout = 'groups'
         files = $entries
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $App 'manifest.json') -Encoding UTF8
 }
@@ -220,18 +225,17 @@ function Package-Application {
         $source = (Resolve-Path -LiteralPath $RuntimeSource).Path
         if (-not $source.Equals($App, [StringComparison]::OrdinalIgnoreCase)) {
             foreach ($name in $RuntimeNames) {
-                Copy-Tree (Join-Path $source $name) (Join-Path $App $name)
+                $destination = Join-Path $App $name
+                if ($name -eq 'images') {
+                    $manifestPath = Join-Path $App 'manifest.json'
+                    Initialize-ImagesLayout -SourceImages (Join-Path $source $name) -TargetImages $destination `
+                        -ManifestPath $manifestPath -FirstInstall (-not (Test-Path -LiteralPath $manifestPath))
+                } else {
+                    Copy-Tree (Join-Path $source $name) $destination
+                }
             }
             if (Test-Path -LiteralPath (Join-Path $source 'licenses')) {
                 Copy-Tree (Join-Path $source 'licenses') (Join-Path $App 'licenses')
-            }
-        }
-    }
-    if (-not $SkipRuntime) {
-        $required = @('emoji\00.png')
-        foreach ($file in $required) {
-            if (-not (Test-Path -LiteralPath (Join-Path $App $file))) {
-                throw "Missing $file. Use -RuntimeSource <complete-package> or -SkipRuntime for an EXE-only build."
             }
         }
     }
@@ -265,8 +269,8 @@ function Package-Application {
 
 function Invoke-CoreTest([string]$Argument, [string]$Label) {
     $temporary = Join-Path $App '_core_tests.exe'
-    $sources = @('settings', 'common', 'output', 'longshot', 'pin', 'ocr',
-        'fast_ocr', 'style_popup', 'ocr_setup') |
+    $sources = @('settings', 'common', 'autostart', 'output', 'longshot', 'pin', 'ocr', 'desktop_duplication',
+        'fast_ocr', 'style_popup', 'emoji_renderer', 'ocr_setup', 'annotate', 'animated_image') |
         ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
     if (-not $script:CoreCompiled) {
         Compile-Target 'core' (@((Join-Path $Root 'cpp\tests\core_tests.cpp')) + $sources) `
@@ -282,19 +286,48 @@ function Invoke-CoreTest([string]$Argument, [string]$Label) {
 function Invoke-UITest {
     $temporary = Join-Path $App '_ui_preview.exe'
     $sources = @($AppSources | Where-Object {
-        [IO.Path]::GetFileName($_) -notin @('main.cpp', 'style_popup.cpp')
+          [IO.Path]::GetFileName($_) -notin @('main.cpp', 'style_popup.cpp', 'overlay.cpp', 'longshot.cpp', 'output.cpp', 'emoji_renderer.cpp', 'emoji_popup.cpp', 'pin.cpp')
     })
     Compile-Target 'ui' (@((Join-Path $Root 'cpp\tests\ui_preview.cpp')) + $sources) `
         $temporary $false $false
     & $temporary (Join-Path $Reports 'ui-previews') 2>&1 |
         Tee-Object -FilePath (Join-Path $Reports 'ui-tests.txt')
     if ($LASTEXITCODE -ne 0) { throw 'UI test failed' }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-images-layout.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Image layout test failed' }
+}
+
+function Invoke-CaptureTest {
+    $exe = Join-Path $Tests 'capture_tests.exe'
+    $sources = @($AppSources | Where-Object { [IO.Path]::GetFileName($_) -ne 'main.cpp' })
+    Compile-Target 'capture-tests' (@((Join-Path $Root 'cpp\tests\capture_tests.cpp')) + $sources) `
+        $exe $false $false
+    & $exe (Join-Path $Reports 'capture-session') 2>&1 |
+        Tee-Object -FilePath (Join-Path $Reports 'capture-tests.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'Capture test failed' }
+}
+
+function Invoke-OcrLifecycleTest {
+    $fixture = Join-Path $Tests 'ocr_worker_fixture.exe'
+    $exe = Join-Path $Tests 'ocr_lifecycle_tests.exe'
+    Compile-Target 'ocr-fixture' @((Join-Path $Root 'cpp\tests\ocr_worker_fixture.cpp')) `
+        $fixture $false $false
+    $sources = @('settings', 'common', 'ocr', 'fast_ocr', 'ocr_setup') |
+        ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
+    Compile-Target 'ocr-lifecycle' (@((Join-Path $Root 'cpp\tests\ocr_lifecycle_tests.cpp')) + $sources) `
+        $exe $false $false
+    & $exe $fixture (Join-Path $Reports 'ocr-lifecycle') 2>&1 |
+        Tee-Object -FilePath (Join-Path $Reports 'ocr-lifecycle-tests.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'OCR lifecycle test failed' }
 }
 
 function Test-Application {
     $script:CoreCompiled = $false
     Ensure-Directory $Tests
     Ensure-Directory $Reports
+    if ($Suite -eq 'Lifecycle') { Invoke-OcrLifecycleTest; return }
+    # Capture exercises a real D3D desktop and does not need OCR components.
+    if ($Suite -eq 'Capture') { Invoke-CaptureTest; return }
     $scratch = Join-Path $Reports 'scratch'
     Ensure-Directory $scratch
     $oldTemp = $env:TEMP
@@ -314,6 +347,7 @@ function Test-Application {
         if ($Suite -in @('CPU', 'All')) { Invoke-CoreTest '--fast' 'cpu' }
         if ($Suite -in @('GPU', 'All')) { Invoke-CoreTest '--fast-gpu' 'gpu' }
         if ($Suite -in @('UI', 'All')) { Invoke-UITest }
+        if ($Suite -eq 'All') { Invoke-OcrLifecycleTest }
     } finally {
         $env:TEMP = $oldTemp
         $env:TMP = $oldTmp
@@ -356,6 +390,13 @@ function Write-Zip {
 }
 
 try {
+    if ($Task -eq 'Deploy') {
+        & (Join-Path $PSScriptRoot 'build.ps1') -Task Build
+        if ($LASTEXITCODE -ne 0) { throw 'Build failed before deploy' }
+        & (Join-Path $PSScriptRoot 'deploy-installed.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'Deploy failed' }
+        exit 0
+    }
     if ($Task -eq 'Clean') {
         $safe = Assert-InRelease $Intermediate
         if (Test-Path -LiteralPath $safe) {

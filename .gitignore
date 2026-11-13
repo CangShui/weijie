@@ -6,6 +6,7 @@ Release/Tests/
 Release/verification/
 Release/archives/
 Release/weijie/manifest.json
+Release/weijie/*.zip
 Release/weijie/ocr-ncnn/
 runtime/ocr-ncnn/
 *.obj

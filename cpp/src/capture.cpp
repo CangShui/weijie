@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "settings.h"
+#include "desktop_duplication.h"
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -67,17 +68,32 @@ static bool is_window_candidate(HWND h, POINT pt, RECT& r) {
 }
 
 bool capture_desktop(Shot& s) {
+    return capture_desktop(s,load_settings());
+}
+
+bool capture_desktop(Shot& s,const Settings& cfg) {
+    LogTrace trace;
+    const auto started=GetTickCount64();
     free_shot(s);
 
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (vw <= 0 || vh <= 0) return false;
+    logf(L"抓屏开始：虚拟桌面=%dx%d 原点=(%d,%d)，先取游戏画面再切换焦点", vw, vh, vx, vy);
+    if (vw <= 0 || vh <= 0) {
+        logf(L"抓屏被拒绝：虚拟桌面尺寸无效");
+        return false;
+    }
 
     HDC hdcScreen = GetDC(nullptr);
-    if (!hdcScreen) return false;
+    if (!hdcScreen) { logf(L"抓屏失败：无法取得桌面 DC error=%lu", GetLastError()); return false; }
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    if (!hdcMem) {
+        logf(L"抓屏失败：无法创建内存 DC error=%lu", GetLastError());
+        ReleaseDC(nullptr, hdcScreen);
+        return false;
+    }
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -90,13 +106,24 @@ bool capture_desktop(Shot& s) {
     void* bits = nullptr;
     HBITMAP hbm = CreateDIBSection(hdcScreen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!hbm) {
+        logf(L"抓屏失败：无法创建原始位图 error=%lu", GetLastError());
         DeleteDC(hdcMem);
         ReleaseDC(nullptr, hdcScreen);
         return false;
     }
     HGDIOBJ old = SelectObject(hdcMem, hbm);
-    BOOL ok = BitBlt(hdcMem, 0, 0, vw, vh, hdcScreen, vx, vy, SRCCOPY | CAPTUREBLT);
-    Settings cfg = load_settings();
+    // 先初始化屏幕之间的空隙；DXGI 按各屏的物理位置填充画面。
+    std::fill_n((DWORD*)bits, (size_t)vw * vh, 0xFF000000);
+    RECT desktop{vx, vy, vx + vw, vy + vh};
+    bool gdiOk = BitBlt(hdcMem, 0, 0, vw, vh, hdcScreen, vx, vy, SRCCOPY | CAPTUREBLT) != FALSE;
+    DWORD gdiError = gdiOk ? ERROR_SUCCESS : GetLastError();
+    GdiFlush();
+    const auto gdiFinished=GetTickCount64();
+    logf(L"GDI 抓屏基底：结果=%s error=%lu 耗时=%llums，随后按屏更新 DXGI 画面",
+         gdiOk ? L"成功" : L"失败", gdiError,gdiFinished-started);
+    bool dxgiOk = capture_desktop_dxgi((BYTE*)bits, desktop, gdiOk);
+    const auto dxgiFinished=GetTickCount64();
+    bool ok = dxgiOk || gdiOk;
     if (ok && cfg.include_cursor) {
         CURSORINFO ci = {};
         ci.cbSize = sizeof(ci);
@@ -112,10 +139,12 @@ bool capture_desktop(Shot& s) {
             }
         }
     }
+    GdiFlush(); // 后续直接读取 DIB 内存，先提交 GDI 的光标绘制与回退抓屏。
     SelectObject(hdcMem, old);
     DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdcScreen);
     if (!ok) {
+        logf(L"抓屏返回：失败，未创建冻结帧");
         DeleteObject(hbm);
         return false;
     }
@@ -124,6 +153,7 @@ bool capture_desktop(Shot& s) {
     void* dimBits = nullptr;
     HBITMAP hbmDim = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &dimBits, nullptr, 0);
     if (!hbmDim) {
+        logf(L"抓屏失败：无法创建遮罩位图 error=%lu", GetLastError());
         DeleteObject(hbm);
         return false;
     }
@@ -145,6 +175,9 @@ bool capture_desktop(Shot& s) {
     // 直接包裹 DIB 内存，零拷贝
     s.bmp = new Gdiplus::Bitmap(vw, vh, vw * 4, PixelFormat32bppRGB, (BYTE*)bits);
     s.bmpDim = new Gdiplus::Bitmap(vw, vh, vw * 4, PixelFormat32bppRGB, (BYTE*)dimBits);
+    logf(L"抓屏返回：成功，冻结帧与压暗副本=%dx%d 包含鼠标=%d GDI=%llums DXGI=%llums 光标遮罩=%llums 总计=%llums",
+        vw,vh,(int)cfg.include_cursor,gdiFinished-started,dxgiFinished-gdiFinished,
+        GetTickCount64()-dxgiFinished,GetTickCount64()-started);
     return true;
 }
 

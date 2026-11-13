@@ -1,7 +1,6 @@
 #pragma once
 #include "common.h"
 struct Overlay;
-void show_tool_slider(Overlay* overlay,int tool);
 void show_color_picker(Overlay* overlay);
 void close_style_popup(Overlay* overlay);
 Gdiplus::Color hsv_color(double hue,double saturation,double value,BYTE alpha=255);

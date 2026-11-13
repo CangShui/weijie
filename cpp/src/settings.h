@@ -1,6 +1,8 @@
 #pragma once
 #include "common.h"
 
+inline constexpr int OCR_IDLE_TIMEOUT_MINUTES[] = {0, 1, 10, 60, 720, 1440};
+
 struct Settings {
     std::wstring hotkey    = L"Ctrl+Shift+A";
     bool hotkey_enabled = true;
@@ -16,6 +18,7 @@ struct Settings {
     std::wstring ocr_engine = L"ppocr";
     std::wstring ocr_benchmark;
     bool ocr_enabled = false;
+    int ocr_idle_minutes = 0;             // 0 = off
     bool translate_enabled = true;
     std::wstring ocr_model_dir;           // empty = %LOCALAPPDATA%\weijie\hunyuan-ocr
     std::wstring llm_base  = L"https://api.deepseek.com/v1";

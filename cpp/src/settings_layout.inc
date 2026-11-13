@@ -52,7 +52,7 @@ static void cfg_paint(CfgDlg*d,HDC dc){
         ui::box(g,field,Color::White,7,GetFocus()==h?ui::green():ui::line());
     }
     ui::separator(g,24,576,792);
-    ui::text(g,L"更改将在保存后生效",r(228,594,300,34),12,ui::muted());
+    ui::text(g,L"识别关闭即时生效，其它更改保存后生效",r(228,594,350,34),12,ui::muted());
     Graphics out(dc);out.SetPageUnit(UnitPixel);out.DrawImage(&b,0,0,rc.right,rc.bottom);
 }
 static void cfg_layout(CfgDlg*d){
@@ -66,6 +66,7 @@ static void cfg_layout(CfgDlg*d){
     d->monitor=setting_check(d,0,L"启用全局截图快捷键",226,115,530,16,g_cfg.hotkey_enabled);
     label(d,0,L"截图快捷键",226,161,132);
     d->hotkey=control(d,0,HOTKEY_CLASSW,L"",WS_TABSTOP,379,160,260,26,100);
+    SetWindowSubclass(d->hotkey,hotkey_record_proc,732,0);
     UINT mods=0,vk=0;resolve_hotkey(g_cfg.hotkey,mods,vk);
     BYTE flags=((mods&MOD_CONTROL)?HOTKEYF_CONTROL:0)|((mods&MOD_ALT)?HOTKEYF_ALT:0)|((mods&MOD_SHIFT)?HOTKEYF_SHIFT:0);
     SendMessageW(d->hotkey,HKM_SETHOTKEY,MAKEWORD(vk,flags),0);
@@ -88,10 +89,19 @@ static void cfg_layout(CfgDlg*d){
     setting_hint(d,0,L"截图中也可右键调整",538,375,254,24);
     d->autoCopy=setting_check(d,0,L"保存后同时复制到剪贴板",226,415,550,12,g_cfg.auto_copy);
     d->includeCursor=setting_check(d,0,L"截图包含鼠标指针",226,456,550,13,g_cfg.include_cursor);
-    d->autostart=setting_check(d,0,L"开机自动启动",226,497,550,15,autostart_enabled());
+    d->autostart=setting_check(d,0,L"开机自动启动（管理员权限）",226,497,550,15,autostart_enabled());
 
-    d->ocrEnabled=setting_check(d,1,L"启用文字识别",226,115,550,14,g_cfg.ocr_enabled);
-    setting_hint(d,1,L"关闭后隐藏工具条中的识别和翻译按钮。",226,154,566,25);
+    d->ocrEnabled=setting_check(d,1,L"启用文字识别（主开关）",226,115,550,14,g_cfg.ocr_enabled);
+    setting_hint(d,1,L"关闭立即停止识别并卸载模型；开启在保存后生效，按需加载。",226,154,566,25);
+    label(d,1,L"空闲自动回收",226,187,132);
+    d->ocrIdle=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,179,418,210,111);
+    const wchar_t* idleLabels[]={L"off",L"1分钟",L"10分钟",L"1小时",L"12小时",L"24小时"};
+    for(int i=0;i<6;++i){
+        SendMessageW(d->ocrIdle,CB_ADDSTRING,0,(LPARAM)idleLabels[i]);
+        SendMessageW(d->ocrIdle,CB_SETITEMDATA,i,OCR_IDLE_TIMEOUT_MINUTES[i]);
+        if(g_cfg.ocr_idle_minutes==OCR_IDLE_TIMEOUT_MINUTES[i])
+            SendMessageW(d->ocrIdle,CB_SETCURSEL,i,0);
+    }
     label(d,1,L"识别引擎",226,239,132);
     d->ocrEngine=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,231,418,200,109);
     for(auto t:{L"混元 OCR · 高精度 Q8",L"混元 OCR · 轻量 Q3",L"PP-OCRv6 · ncnn Vulkan · 极速"})SendMessageW(d->ocrEngine,CB_ADDSTRING,0,(LPARAM)t);
@@ -107,7 +117,7 @@ static void cfg_layout(CfgDlg*d){
     }
     SendMessageW(d->ocrBackend,CB_SETCURSEL,
                  g_cfg.ocr_backend==L"gpu"?(gpuAvailable?2:1):g_cfg.ocr_backend==L"cpu"?1:0,0);
-    setting_hint(d,1,L"截图识别在本机完成，不上传图片。",226,330,566,22);
+    setting_hint(d,1,L"空闲超时释放模型；不打断识别，下次调用按需加载。",226,330,566,22);
     setting_hint(d,1,L"GPU 使用 Vulkan：支持 Intel / AMD / NVIDIA；无 Vulkan 驱动时自动回退 CPU。",226,352,566,22);
     d->ocrBench=control(d,1,L"STATIC",L"PP-OCRv6 组件与模型按需下载；混元模型地址不变。",0,226,378,566,24);
     d->ocrStatus=control(d,1,L"STATIC",L"",0,226,404,566,40,105);
@@ -118,8 +128,8 @@ static void cfg_layout(CfgDlg*d){
     label(d,1,L"本地推理 · 保护隐私",484,480,308,24);
     setting_hint(d,1,L"下载前请阅读随程序提供的模型许可。",226,520,566,24);
 
-    d->translateEnabled=setting_check(d,2,L"启用翻译服务",226,115,550,17,g_cfg.translate_enabled);
-    setting_hint(d,2,L"关闭后隐藏截图工具条中的翻译按钮。",226,154,566,25);
+    d->translateEnabled=setting_check(d,2,L"显示翻译按钮",226,115,550,17,g_cfg.translate_enabled);
+    setting_hint(d,2,L"独立显示翻译按钮；识别关闭时仍可翻译已有文字，不加载模型。",226,154,566,25);
     label(d,2,L"接口地址",226,282,132);
     d->base=setting_edit(d,2,374,274,418,106);
     label(d,2,L"API Key",226,342,132);

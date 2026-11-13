@@ -4,15 +4,18 @@
 #include "longshot.h"
 #include "style_popup.h"
 #include "emoji_popup.h"
+#include "emoji_renderer.h"
 #include "fast_ocr.h"
 #include "translate.h"
 #include "pin.h"
 #include "output.h"
+#include "animated_image.h"
 #include "ui_theme.h"
 #include <imm.h>
 #include <memory>
 #include <mutex>
 #include <commctrl.h>
+#include <optional>
 
 #pragma comment(lib, "imm32.lib")
 
@@ -52,6 +55,12 @@ static Color C_GREEN(255, 7, 193, 96);
 static Color C_LABEL_BG(170, 0, 0, 0);
 
 static std::shared_ptr<Overlay> g_ov;
+static uint64_t overlay_animation_time(const Overlay* o){
+    uint64_t time=GetTickCount64()-o->animationStart,period=0;
+    for(const auto& a:o->anns)if(a.kind==AK_EMOJI&&a.emojiAnimation)
+        period=std::max(period,a.emojiAnimation->duration);
+    return period?time%period:time;
+}
 static HBITMAP g_backBuf = nullptr;
 static HDC g_backDC = nullptr;
 static int g_bw = 0, g_bh = 0;
@@ -64,7 +73,25 @@ struct JobMsg {
     bool translated = false;
 };
 
+static void clear_brush_cursor(Overlay* o){
+    if(!o->brushCursor)return;
+    if(GetCursor()==o->brushCursor)SetCursor(LoadCursorW(nullptr,IDC_ARROW));
+    DestroyCursor(o->brushCursor);o->brushCursor=nullptr;
+    logf(L"笔刷尺寸光标已释放：工具=%d 直径=%dpx",o->brushCursorTool,o->brushCursorDiameter);
+}
+
+static void clear_stamp_preview(Overlay* o){
+    if(!o->stampPreview)return;
+    LogTrace trace(o->traceId);
+    DestroyWindow(o->stampPreview);o->stampPreview=nullptr;
+    o->stampPreviewVisible=false;o->stampPreviewSide=0;
+    logf(L"序号/表情虚影已释放，不影响已放置标注");
+}
+
 Overlay::~Overlay() {
+    clear_stamp_preview(this);
+    clear_brush_cursor(this);
+
     if(resultFont)DeleteObject(resultFont);
     free_shot(shot);
     delete mosaic;
@@ -72,18 +99,6 @@ Overlay::~Overlay() {
 }
 
 // ------------------------------------------------------------------ 小工具
-static void force_foreground(HWND h) {
-    ShowWindow(h, SW_RESTORE);
-    HWND fg = GetForegroundWindow();
-    DWORD cur = GetCurrentThreadId();
-    DWORD other = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-    bool attached = false;
-    if (other && other != cur) attached = !!AttachThreadInput(other, cur, TRUE);
-    SetForegroundWindow(h);
-    SetFocus(h);
-    if (attached) AttachThreadInput(other, cur, FALSE);
-}
-
 static RectF handle_rect(const RECT& s, int which, float sz) {
     float cx = 0, cy = 0;
     float l = (float)s.left, t = (float)s.top, r = (float)s.right, b = (float)s.bottom;
@@ -233,7 +248,7 @@ static void i_mosaic(Graphics& g, const RectF& a, Color c) {
         GraphicsState st = g.Save();
         GraphicsPath clip;
         round_path(clip, box, k.S(1.6f));
-        g.SetClip(&clip);
+        g.SetClip(&clip,CombineModeIntersect);
         SolidBrush br(c);
         for (int row = 0; row < 4; ++row)
             for (int col = 0; col < 4; ++col)
@@ -821,7 +836,7 @@ static void draw_panel(Graphics& g, Overlay* o) {
     RectF body;
     panel_body_rect(o, body);
     GraphicsState st = g.Save();
-    g.SetClip(body);
+    g.SetClip(body,CombineModeIntersect);
     if (o->panel == PM_LOADING) {
         Font f(FONT_UI(), SF(13.0f), FontStyleRegular, UnitPixel);
         SolidBrush dim(Color(255, 140, 140, 140));
@@ -949,7 +964,7 @@ static void draw_magnifier(Graphics& g, Overlay* o, POINT pos) {
     GraphicsPath clip;
     clip.AddEllipse(cx - R, cy - R, R * 2, R * 2);
     GraphicsState st = g.Save();
-    g.SetClip(&clip);
+    g.SetClip(&clip,CombineModeIntersect);
     g.SetInterpolationMode(InterpolationModeNearestNeighbor);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
     g.DrawImage(o->shot.bmp, RectF(cx - R, cy - R, R * 2, R * 2), sx, sy, span, span, UnitPixel);
@@ -1096,7 +1111,259 @@ static HICON pointer_cursor() {
     return g_pointer;
 }
 
+static HCURSOR make_brush_cursor(int tool,int diameter,Color ink){
+    const int pad=2,side=diameter+pad*2,hot=pad+diameter/2;
+    BITMAPV5HEADER bi{};bi.bV5Size=sizeof(bi);bi.bV5Width=side;bi.bV5Height=-side;
+    bi.bV5Planes=1;bi.bV5BitCount=32;bi.bV5Compression=BI_BITFIELDS;
+    bi.bV5RedMask=0x00ff0000;bi.bV5GreenMask=0x0000ff00;
+    bi.bV5BlueMask=0x000000ff;bi.bV5AlphaMask=0xff000000;
+    void* bits=nullptr;HDC dc=GetDC(nullptr);
+    HBITMAP color=CreateDIBSection(dc,(BITMAPINFO*)&bi,DIB_RGB_COLORS,&bits,nullptr,0);
+    ReleaseDC(nullptr,dc);
+    if(!color||!bits){if(color)DeleteObject(color);return nullptr;}
+    {
+        Bitmap image(side,side,side*4,PixelFormat32bppARGB,(BYTE*)bits);
+        Graphics g(&image);g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(PixelOffsetModeHalf);g.Clear(Color(0,0,0,0));
+        RectF area=brush_footprint(PointF((float)hot,(float)hot),(float)diameter);
+        if(tool==T_MOSAIC){
+            const int cell=std::max(2,diameter/6);
+            Bitmap tiles(cell*2,cell*2,PixelFormat32bppARGB);
+            {
+                Graphics tileGraphics(&tiles);tileGraphics.SetCompositingMode(CompositingModeSourceCopy);
+                for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+                    BYTE shade=(x+y)%2?225:85;
+                    SolidBrush tile(Color(130,shade,shade,shade));
+                    tileGraphics.FillRectangle(&tile,x*cell,y*cell,cell,cell);
+                }
+            }
+            TextureBrush pattern(&tiles,WrapModeTile);g.FillEllipse(&pattern,area);
+        }else{
+            SolidBrush fill(Color(diameter<5?255:110,ink.GetR(),ink.GetG(),ink.GetB()));
+            g.FillEllipse(&fill,area);
+        }
+        if(diameter>=5){
+            Pen dark(Color(245,20,20,20),1),light(Color(245,255,255,255),1);
+            g.DrawEllipse(&dark,area.X+.5f,area.Y+.5f,area.Width-1,area.Height-1);
+            if(diameter>=7)g.DrawEllipse(&light,area.X+1.5f,area.Y+1.5f,area.Width-3,area.Height-3);
+        }
+    }
+    int stride=((side+15)/16)*2;std::vector<BYTE> zero((size_t)stride*side,0);
+    HBITMAP mask=CreateBitmap(side,side,1,1,zero.data());
+    ICONINFO info{};info.fIcon=FALSE;info.xHotspot=hot;info.yHotspot=hot;
+    info.hbmColor=color;info.hbmMask=mask;
+    HCURSOR cursor=mask?(HCURSOR)CreateIconIndirect(&info):nullptr;
+    if(mask)DeleteObject(mask);DeleteObject(color);
+    return cursor;
+}
+
+static int active_brush_tool(const Overlay* o){
+    if(o->mode==4&&o->hasCur)
+        return o->cur.kind==AK_PEN?T_PEN:o->cur.kind==AK_MOSAIC?T_MOSAIC:T_NONE;
+    return o->tool==T_PEN||o->tool==T_MOSAIC?o->tool:T_NONE;
+}
+
+static bool brush_cursor_at(Overlay* o,POINT pt){
+    if(!o->alive||!o->hasSel||o->editing||o->annotationDrag.active||(o->mode!=0&&o->mode!=4)||active_brush_tool(o)==T_NONE||
+       !ptInRect(o->sel,pt.x,pt.y))return false;
+    if(o->mode==0&&handle_at(o,pt)>=0)return false;
+    if(o->sizeDrag.active&&ptInRect(o->sizeDrag.bounds,pt.x,pt.y))return false;
+    if(o->tbVisible&&ptInRectF(RectF(o->tbX,o->tbY,toolbar_width(o),SF(TB_HEIGHT)),(float)pt.x,(float)pt.y))return false;
+    return o->panel==PM_HIDDEN||!ptInRectF(o->panelRect,(float)pt.x,(float)pt.y);
+}
+
+static HCURSOR brush_cursor(Overlay* o){
+    int tool=active_brush_tool(o);
+    int diameter=(int)lround(o->mode==4&&o->hasCur?o->cur.width:o->annotation_width(tool));
+    Color ink=o->mode==4&&o->hasCur?o->cur.color:o->ink;
+    if(o->brushCursorDiameter==diameter&&o->brushCursorTool==tool&&o->brushCursorColor==ink.GetValue())
+        return o->brushCursor;
+    HCURSOR next=make_brush_cursor(tool,diameter,ink);
+    DWORD error=next?ERROR_SUCCESS:GetLastError();
+    clear_brush_cursor(o);
+    o->brushCursor=next;o->brushCursorDiameter=diameter;o->brushCursorTool=tool;o->brushCursorColor=ink.GetValue();
+    logf(L"笔刷尺寸光标更新：工具=%s 设置直径=%dpx 实际直径=%d截图像素 DPI比例=%.2f 创建成功=%d error=%lu",
+         tool==T_PEN?L"画笔":L"马赛克",o->toolSizes[tool-T_RECT],diameter,g_scale,(int)(next!=nullptr),error);
+    return next;
+}
+
+static float text_line_height(int size){
+    Font font(FONT_UI(),SF((float)size),FontStyleRegular,UnitPixel);
+    return std::max(1.0f,font.GetHeight(96.0f));
+}
+
+static RectF text_caret_rect(PointF position,int size){
+    return RectF(position.X,position.Y+SF(1),SF(1.6f),text_line_height(size));
+}
+
+// 预览和落地共用尺寸、样式和中心坐标，悬停不消耗序号。
+static Ann stamp_annotation(const Overlay* o,PointF position){
+    Ann stamp;stamp.pos=position;stamp.color=o->ink;
+    if(o->tool==T_NUMBER){
+        stamp.kind=AK_NUMBER;stamp.diameter=(float)o->toolSizes[T_NUMBER-T_RECT];
+        stamp.index=o->numberSeq+1;
+    }else{
+        stamp.kind=AK_EMOJI;stamp.emojiIndex=o->emojiIndex;
+        stamp.emojiImage=o->emojiImage?o->emojiImage:emoji_image(o->emojiIndex);
+        stamp.emojiAnimation=o->emojiAnimation?o->emojiAnimation:emoji_animation(o->emojiIndex);
+        stamp.fontSize=(float)o->toolSizes[T_EMOJI-T_RECT];
+    }
+    return stamp;
+}
+
+static constexpr BYTE STAMP_PREVIEW_ALPHA=128;
+
+static HBITMAP stamp_preview_bitmap(Ann stamp,int side,uint64_t time=0){
+    BITMAPINFO bi{};bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth=side;bi.bmiHeader.biHeight=-side;
+    bi.bmiHeader.biPlanes=1;bi.bmiHeader.biBitCount=32;
+    void* bits=nullptr;
+    HBITMAP bitmap=CreateDIBSection(nullptr,&bi,DIB_RGB_COLORS,&bits,nullptr,0);
+    if(!bitmap)return nullptr;
+    bool ok=false;
+    {
+        Bitmap image(side,side,side*4,PixelFormat32bppPARGB,(BYTE*)bits);
+        Graphics graphics(&image);
+        graphics.Clear(Color(0,0,0,0));
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        graphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+        stamp.pos=PointF((float)(side/2),(float)(side/2));
+        stamp.draw(graphics,nullptr,time);
+        ok=graphics.GetLastStatus()==Ok;
+    }
+    if(!ok){DeleteObject(bitmap);return nullptr;}
+    return bitmap;
+}
+
+static LRESULT CALLBACK stamp_preview_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
+    if(msg==WM_NCHITTEST)return HTTRANSPARENT;
+    if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
+    return DefWindowProcW(h,msg,wp,lp);
+}
+
+static void hide_stamp_preview(Overlay* o,const wchar_t* reason){
+    if(!o->stampPreviewVisible)return;
+    LogTrace trace(o->traceId);
+    ShowWindow(o->stampPreview,SW_HIDE);o->stampPreviewVisible=false;
+    logf(L"序号/表情虚影隐藏：%s；预览不写入截图",reason);
+}
+
+static bool stamp_preview_at(Overlay* o,POINT pt){
+    HWND foreground=GetForegroundWindow(),capture=GetCapture();
+    if(!o->alive||!o->hasSel||o->editing||o->annotationDrag.active||o->mode!=0||o->stampPressed||
+       (o->tool!=T_NUMBER&&o->tool!=T_EMOJI)||!ptInRect(o->sel,pt.x,pt.y)||handle_at(o,pt)>=0||
+       (capture&&capture!=o->hwnd)||
+       (foreground!=o->hwnd&&(!o->stylePopup||foreground!=o->stylePopup)&&
+        (!o->emojiPopup||foreground!=o->emojiPopup)))return false;
+    if(o->tool==T_EMOJI&&!o->emojiImage&&emoji_count()==0)return false;
+    if(o->sizeDrag.active&&ptInRect(o->sizeDrag.bounds,pt.x,pt.y))return false;
+    if(o->tbVisible&&ptInRectF(RectF(o->tbX,o->tbY,toolbar_width(o),SF(TB_HEIGHT)),(float)pt.x,(float)pt.y))return false;
+    return o->panel==PM_HIDDEN||!ptInRectF(o->panelRect,(float)pt.x,(float)pt.y);
+}
+
+static void update_stamp_preview(Overlay* o,POINT pt){
+    if(!stamp_preview_at(o,pt)){hide_stamp_preview(o,L"指针不在可放置区域或正在操作其他控件");return;}
+    Ann stamp=stamp_annotation(o,{});
+    uint64_t time=GetTickCount64()-o->animationStart;
+    size_t frame=stamp.emojiAnimation?stamp.emojiAnimation->frame_index(time):0;
+    int side=(int)ceil(stamp.bounds().Width)+4;
+    const Ann& key=o->stampPreviewKey;
+    bool configChanged=!o->stampPreview||o->stampPreviewSide!=side||o->stampPreviewScale!=g_scale||
+        key.kind!=stamp.kind||key.color.GetValue()!=stamp.color.GetValue()||
+        key.diameter!=stamp.diameter||key.fontSize!=stamp.fontSize||
+        key.index!=stamp.index||key.emojiIndex!=stamp.emojiIndex||key.emojiImage!=stamp.emojiImage||
+        key.emojiAnimation!=stamp.emojiAnimation;
+    bool rebuild=configChanged||frame!=o->stampPreviewFrame;
+    POINT position{pt.x+o->shot.vx-side/2,pt.y+o->shot.vy-side/2};
+    if(rebuild){
+        LogTrace trace(o->traceId);
+        if(configChanged)logf(L"序号/表情虚影请求：工具=%d 序号=%d 表情=%d 设置大小=%.0f DPI=%.2f 图像边长=%d 透明度=%d/255",
+            o->tool,stamp.index,stamp.emojiIndex,stamp.kind==AK_NUMBER?stamp.diameter:stamp.fontSize,
+            g_scale,side,STAMP_PREVIEW_ALPHA);
+        if(!o->stampPreview){
+            static bool registered=false;
+            if(!registered){
+                WNDCLASSW wc{};wc.lpfnWndProc=stamp_preview_proc;wc.hInstance=GetModuleHandleW(nullptr);
+                wc.lpszClassName=L"weijieStampPreview";
+                registered=RegisterClassW(&wc)!=0;
+            }
+            o->stampPreview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|
+                WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"weijieStampPreview",L"",WS_POPUP,
+                position.x,position.y,side,side,o->hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+        }
+        HBITMAP bitmap=stamp_preview_bitmap(stamp,side,time);
+        HDC dc=CreateCompatibleDC(nullptr);HGDIOBJ old=bitmap&&dc?SelectObject(dc,bitmap):nullptr;
+        SIZE size{side,side};POINT source{};BLENDFUNCTION blend{AC_SRC_OVER,0,STAMP_PREVIEW_ALPHA,AC_SRC_ALPHA};
+        bool ok=o->stampPreview&&old&&UpdateLayeredWindow(o->stampPreview,nullptr,&position,&size,
+            dc,&source,0,&blend,ULW_ALPHA);
+        DWORD error=ok?ERROR_SUCCESS:GetLastError();
+        if(old)SelectObject(dc,old);
+        if(dc)DeleteDC(dc);
+        if(bitmap)DeleteObject(bitmap);
+        if(!ok){
+            logf(L"序号/表情虚影创建失败：error=%lu；仍可正常点击放置标注",error);
+            clear_stamp_preview(o);return;
+        }
+        o->stampPreviewKey=stamp;o->stampPreviewScale=g_scale;o->stampPreviewSide=side;
+        o->stampPreviewFrame=frame;
+        if(configChanged)logf(L"序号/表情虚影绘制完成：复用实际标注绘制，动画只刷新变化帧");
+    }
+    // 只在选区内显示；靠近工具条、结果面板或弹窗时不覆盖它们。
+    int left=pt.x-side/2,top=pt.y-side/2;
+    HRGN region=CreateRectRgn(o->sel.left-left,o->sel.top-top,o->sel.right-left,o->sel.bottom-top);
+    auto exclude=[&](RECT rect){
+        HRGN cut=CreateRectRgn(rect.left-left,rect.top-top,rect.right-left,rect.bottom-top);
+        CombineRgn(region,region,cut,RGN_DIFF);DeleteObject(cut);
+    };
+    if(o->tbVisible)exclude({(LONG)floor(o->tbX),(LONG)floor(o->tbY),
+        (LONG)ceil(o->tbX+toolbar_width(o)),(LONG)ceil(o->tbY+SF(TB_HEIGHT))});
+    if(o->panel!=PM_HIDDEN)exclude({(LONG)floor(o->panelRect.X),(LONG)floor(o->panelRect.Y),
+        (LONG)ceil(o->panelRect.GetRight()),(LONG)ceil(o->panelRect.GetBottom())});
+    if(o->sizeDrag.active)exclude(o->sizeDrag.bounds);
+    for(HWND popup:{o->stylePopup,o->emojiPopup})if(popup&&IsWindowVisible(popup)){
+        RECT rect{};GetWindowRect(popup,&rect);OffsetRect(&rect,-o->shot.vx,-o->shot.vy);exclude(rect);
+    }
+    if(!SetWindowRgn(o->stampPreview,region,FALSE))DeleteObject(region);
+    SetWindowPos(o->stampPreview,HWND_TOPMOST,position.x,position.y,side,side,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    if(!o->stampPreviewVisible){
+        LogTrace trace(o->traceId);
+        o->stampPreviewVisible=true;
+        logf(L"序号/表情虚影已显示：点击中心即落点，半透明预览不参与保存或复制");
+    }
+    if(!o->stampPreviewTracking){
+        TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,o->hwnd,0};
+        o->stampPreviewTracking=TrackMouseEvent(&track)!=FALSE;
+    }
+}
+
 static void draw_editing(Graphics& g, Overlay* o);
+static void draw_text_frame(Graphics& g,Overlay* o);
+static void draw_annotation_selection(Graphics& g,Overlay* o);
+
+static void draw_size_drag(Graphics& g,const Overlay* o){
+    const auto& drag=o->sizeDrag;
+    if(!drag.active)return;
+    RectF area((REAL)drag.bounds.left,(REAL)drag.bounds.top,
+        (REAL)(drag.bounds.right-drag.bounds.left),(REAL)(drag.bounds.bottom-drag.bounds.top));
+    ui::box(g,area,Color(250,255,255,255),9,ui::line());
+    ui::text(g,tool_size_name(drag.tool),RectF(area.X+SF(14),area.Y+SF(7),SF(75),SF(22)),12,ui::ink(),true);
+    ui::text(g,L"按住右键 · 左小右大",RectF(area.X+SF(85),area.Y+SF(8),SF(115),SF(20)),10,ui::muted());
+    RectF value(area.GetRight()-SF(76),area.Y+SF(5),SF(64),SF(25));
+    ui::box(g,value,ui::tint(),6);
+    ui::text(g,std::to_wstring(o->toolSizes[drag.tool-T_RECT])+L" px",value,12,ui::green(),true,StringAlignmentCenter);
+    float left=area.X+SF(16),y=area.Y+SF(43),thumb=left+drag.thumb;
+    Pen base(ui::line(),SF(4)),filled(ui::green(),SF(4));
+    base.SetLineCap(LineCapRound,LineCapRound,DashCapRound);
+    filled.SetLineCap(LineCapRound,LineCapRound,DashCapRound);
+    g.DrawLine(&base,left,y,left+drag.length,y);
+    if(drag.thumb>0)g.DrawLine(&filled,left,y,thumb,y);
+    SolidBrush white(Color::White);Pen edge(ui::green(),SF(1.5f));
+    g.FillEllipse(&white,thumb-SF(6),y-SF(6),SF(12),SF(12));
+    g.DrawEllipse(&edge,thumb-SF(6),y-SF(6),SF(12),SF(12));
+    ui::text(g,std::to_wstring(tool_size_minimum(drag.tool)),RectF(left,area.Y+SF(55),SF(55),SF(15)),9,ui::muted());
+    ui::text(g,std::to_wstring(tool_size_maximum(drag.tool)),RectF(area.GetRight()-SF(71),area.Y+SF(55),SF(55),SF(15)),9,ui::muted(),false,StringAlignmentFar);
+}
 
 static void paint(Overlay* o) {
     PAINTSTRUCT ps;
@@ -1115,6 +1382,8 @@ static void paint(Overlay* o) {
     }
 
     HDC src = CreateCompatibleDC(hdc);
+    int savedDC=SaveDC(g_backDC);
+    IntersectClipRect(g_backDC,ps.rcPaint.left,ps.rcPaint.top,ps.rcPaint.right,ps.rcPaint.bottom);
     HGDIOBJ oldSrc = SelectObject(src, o->shot.hbmDim);
     BitBlt(g_backDC, 0, 0, w, h, src, 0, 0, SRCCOPY);
 
@@ -1131,6 +1400,8 @@ static void paint(Overlay* o) {
 
     {
         Graphics g(g_backDC);
+        g.SetClip(Rect(ps.rcPaint.left,ps.rcPaint.top,ps.rcPaint.right-ps.rcPaint.left,
+            ps.rcPaint.bottom-ps.rcPaint.top));
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         g.SetPixelOffsetMode(PixelOffsetModeHalf);
@@ -1140,13 +1411,17 @@ static void paint(Overlay* o) {
             int sh = o->sel.bottom - o->sel.top;
             if (sw > 0 && sh > 0) {
                 GraphicsState st = g.Save();
-                g.SetClip(Rect(o->sel.left, o->sel.top, sw, sh));
+                g.SetClip(Rect(o->sel.left, o->sel.top, sw, sh),CombineModeIntersect);
                 g.TranslateTransform((REAL)o->sel.left, (REAL)o->sel.top);
                 Bitmap* mos = o->mosaic;
-                for (auto& a : o->anns) a.draw(g, mos);
+                uint64_t time=overlay_animation_time(o);
+                for(size_t i=0;i<o->anns.size();++i)
+                    if(!o->editing||(int)i!=o->editingIndex)o->anns[i].draw(g,mos,time);
                 if (o->hasCur) o->cur.draw(g, mos);
                 draw_editing(g, o);
                 g.Restore(st);
+                st=g.Save();g.TranslateTransform((REAL)o->sel.left,(REAL)o->sel.top);
+                draw_text_frame(g,o);draw_annotation_selection(g,o);g.Restore(st);
             }
 
             // 边框
@@ -1193,15 +1468,18 @@ static void paint(Overlay* o) {
 
         draw_panel(g, o);
         draw_toolbar(g, o);
+        draw_size_drag(g,o);
     }
 
     BitBlt(hdc, 0, 0, w, h, g_backDC, 0, 0, SRCCOPY);
+    RestoreDC(g_backDC,savedDC);
     EndPaint(o->hwnd, &ps);
 }
 
 // ------------------------------------------------------------------ 文字输入（内联）
 static void commit_text(Overlay* o);
 static void cancel_text(Overlay* o);
+static void clear_annotation_selection(Overlay* o,const wchar_t* reason);
 
 static bool ime_composing(HWND h) {
     HIMC imc = ImmGetContext(h);
@@ -1249,73 +1527,8 @@ static void edit_poll_stop(HWND h) {
     KillTimer(h, TIMER_EDIT);
 }
 
-static void begin_text(Overlay* o, POINT pt) {
-    commit_text(o);
-    o->editing = true;
-    o->editText.clear();
-    o->composing.clear();
-    o->editPos = PointF((float)(pt.x - o->sel.left), (float)(pt.y - o->sel.top));
-    edit_attach_ime(o);
-    edit_poll_start(o->hwnd);
-    InvalidateRect(o->hwnd, nullptr, FALSE);
-}
-
-static void commit_text(Overlay* o) {
-    if (!o->editing) return;
-    o->editing = false;
-    std::wstring t = o->editText + o->composing;
-    o->editText.clear();
-    edit_detach_ime(o);
-    edit_poll_stop(o->hwnd);
-
-    size_t b = t.find_first_not_of(L" \t\r\n");
-    size_t e = t.find_last_not_of(L" \t\r\n");
-    if (b != std::wstring::npos) {
-        Ann a;
-        a.kind = AK_TEXT;
-        a.color = o->ink;
-        a.pos = o->editPos;
-        a.text = t.substr(b, e - b + 1);
-        o->redos.clear();
-        a.fontSize=(float)o->toolSizes[T_TEXT-T_RECT];
-        o->anns.push_back(a);
-    }
-    InvalidateRect(o->hwnd, nullptr, FALSE);
-}
-
-static void cancel_text(Overlay* o) {
-    if (!o->editing) return;
-    o->editing = false;
-    o->editText.clear();
-    edit_detach_ime(o);
-    edit_poll_stop(o->hwnd);
-    InvalidateRect(o->hwnd, nullptr, FALSE);
-}
-
-// 正在编辑的文字（局部坐标，随标注一起裁剪/平移）
-static void draw_editing(Graphics& g, Overlay* o) {
-    if (!o->editing) return;
-    std::wstring shown = o->editText + o->composing;
-    Font font(FONT_UI(), SF((float)o->toolSizes[T_TEXT-T_RECT]), FontStyleRegular, UnitPixel);
-    SolidBrush br(o->ink);
-    if (!shown.empty()) {
-        g.DrawString(shown.c_str(), -1, &font, o->editPos, nullptr, &br);
-    }
-    RectF b;
-    g.MeasureString(shown.c_str(), -1, &font, PointF(0, 0), &b);
-    float w = shown.empty() ? 0.0f : b.Width;
-    float cx = o->editPos.X + w;
-    Pen caret(Color(255, 7, 193, 96), SF(1.6f));
-    g.DrawLine(&caret, cx, o->editPos.Y + SF(1.0f), cx, o->editPos.Y + SF(18.0f));
-    if (!o->composing.empty()) {
-        Pen ul(Color(255, 7, 193, 96), SF(1.0f));
-        float left = o->editPos.X + (o->editText.empty() ? 0.0f : 0.0f);
-        RectF pb;
-        g.MeasureString(o->editText.c_str(), -1, &font, PointF(0, 0), &pb);
-        float x0 = o->editPos.X + (o->editText.empty() ? 0.0f : pb.Width);
-        g.DrawLine(&ul, x0, o->editPos.Y + SF(19.0f), cx, o->editPos.Y + SF(19.0f));
-    }
-}
+#include "text_editing.inc"
+#include "annotation_moving.inc"
 
 // ------------------------------------------------------------------ 输出
 static Bitmap* render_result(Overlay* o) {
@@ -1330,6 +1543,7 @@ static Bitmap* render_result(Overlay* o) {
     Graphics g(crop);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
     // 裁剪图的左上角就是选区原点，标注局部坐标直接落上去即可
     Bitmap* mos = o->mosaic;
     for (auto& a : o->anns) a.draw(g, mos);
@@ -1337,9 +1551,12 @@ static Bitmap* render_result(Overlay* o) {
 }
 
 static void do_copy(Overlay* o) {
+    commit_text(o);
     Bitmap* img = render_result(o);
     if (img) {
         bool copied = copy_bitmap_to_clipboard(img);
+        logf(L"截图复制返回：结果=%s 选区=%ldx%ld", copied ? L"成功" : L"失败",
+             o->sel.right - o->sel.left, o->sel.bottom - o->sel.top);
         delete img;
         if (!copied) {
             MessageBoxW(o->hwnd, L"剪贴板暂时无法写入，请重试或保存到文件。",
@@ -1350,16 +1567,35 @@ static void do_copy(Overlay* o) {
     PostMessageW(o->hwnd, WM_CLOSE, 0, 0);
 }
 
-static void do_save(Overlay* o) {
+static std::shared_ptr<AnimatedScreenshot> overlay_animation(Overlay* o,Bitmap* background=nullptr){
+    bool animated=false;
+    for(const auto& a:o->anns)if(a.kind==AK_EMOJI&&a.emojiAnimation){animated=true;break;}
+    if(!animated)return nullptr;
+    auto scene=std::make_shared<AnimatedScreenshot>();
+    scene->annotations=o->anns;scene->scale=g_scale;scene->traceId=o->traceId;
+    scene->background.reset(background?
+        background->Clone(0,0,background->GetWidth(),background->GetHeight(),PixelFormat32bppRGB):
+        o->shot.bmp->Clone(Rect((int)o->sel.left,(int)o->sel.top,(int)(o->sel.right-o->sel.left),
+            (int)(o->sel.bottom-o->sel.top)),PixelFormat32bppRGB));
+    if(o->mosaic)scene->mosaic.reset(o->mosaic->Clone(0,0,o->mosaic->GetWidth(),o->mosaic->GetHeight(),PixelFormat32bppRGB));
+    return scene;
+}
+
+static void do_save(Overlay* o,bool saveAs=false) {
+    commit_text(o);
     Bitmap* img = render_result(o);
     if (!img) return;
     Settings s = load_settings();
     logf(L"保存: 直接保存到 %ls", (s.save_dir.empty() ? default_save_dir() : s.save_dir).c_str());
     std::wstring saved;
-    bool ok = save_bitmap_direct(img, s.save_dir, s.image_format, s.jpeg_quality, saved);
+    bool cancelled=false;
+    auto animation=overlay_animation(o);
+    bool ok=saveAs?save_bitmap_dialog(o->hwnd,img,s.save_dir,s.image_format,s.jpeg_quality,&saved,animation,&cancelled):
+        save_bitmap_direct(img,s.save_dir,s.image_format,s.jpeg_quality,saved,o->hwnd,animation,&cancelled);
     if (ok && s.auto_copy) copy_bitmap_to_clipboard(img);
     logf(L"保存: 结果=%d path=%ls", (int)ok, saved.c_str());
     delete img;
+    if(cancelled){logf(L"截图保存取消：保留编辑界面");return;}
     if (!ok) {
         MessageBoxW(o->hwnd, L"保存失败，请检查设置中的保存位置和图片格式。",
                     L"保存失败", MB_OK | MB_ICONERROR);
@@ -1369,15 +1605,17 @@ static void do_save(Overlay* o) {
 }
 
 static void do_pin(Overlay* o) {
+    commit_text(o);
     Bitmap* img = render_result(o);
     if (!img) return;
     int x = o->shot.vx + o->sel.left;
     int y = o->shot.vy + o->sel.top;
-    pin_create(img, x, y);
+    pin_create(img, x, y,overlay_animation(o));
     PostMessageW(o->hwnd, WM_CLOSE, 0, 0);
 }
 
 static void start_longshot(Overlay* o) {
+    commit_text(o);
     if (!o->hasSel) return;
     if (o->panel == PM_LOADING) return;
 
@@ -1409,7 +1647,7 @@ static void start_longshot(Overlay* o) {
         return;
     }
 
-    longshot_preview(img);
+    longshot_preview(img,err,overlay_animation(o,img));
     PostMessageW(o->hwnd, WM_CLOSE, 0, 0);
 }
 
@@ -1426,7 +1664,21 @@ static void set_panel_loading(Overlay* o, const wchar_t* title) {
 }
 
 static void start_ocr(Overlay* o, bool translateToo) {
-    if (!o->hasSel || !o->ocrEnabled) return;
+    logf(L"图片文字请求到达：操作=%s 识别按钮=%d 翻译按钮=%d",
+         translateToo?L"翻译":L"识别",(int)o->ocrEnabled,(int)o->translateEnabled);
+    if (!o->hasSel || !(translateToo?o->translateEnabled:o->ocrEnabled)) {
+        logf(L"图片文字请求被拒绝：没有选区或对应按钮已关闭");
+        return;
+    }
+    if(!o->ocrEnabled||!ocr_is_enabled()){
+        o->panel=PM_ERROR;
+        o->panelTitle=translateToo?L"翻译":L"提取文字";
+        o->panelBody=L"识别主开关已关闭。请在设置中开启文字识别后再处理图片；关闭期间不会加载模型。";
+        o->panelOriginal.clear();
+        place_panel(o);InvalidateRect(o->hwnd,nullptr,FALSE);
+        logf(L"图片文字请求被拒绝：识别主开关关闭，不因翻译请求重新加载模型");
+        return;
+    }
     int sw = o->sel.right - o->sel.left;
     int sh = o->sel.bottom - o->sel.top;
     if (sw < 2 || sh < 2) return;
@@ -1447,6 +1699,7 @@ static void start_ocr(Overlay* o, bool translateToo) {
     Settings cfg = load_settings();
 
     std::thread([hwnd, keep, crop, translateToo, cfg]() {
+        LogTrace trace(keep->traceId);
         std::wstring text, err;
         bool ok = false;
         // 这里绝不能有异常逃出去：std::thread 里未捕获的异常会直接 std::terminate
@@ -1459,8 +1712,10 @@ static void start_ocr(Overlay* o, bool translateToo) {
             logf(L"OCR 线程异常（已拦截）");
         }
         delete crop;
+        logf(L"图片识别返回：成功=%d 字符数=%zu 错误=%s",(int)ok,text.size(),err.c_str());
 
         auto* msg = new JobMsg();
+        msg->translated = translateToo;
         if (!ok) {
             msg->ok = false;
             msg->err = err;
@@ -1480,18 +1735,23 @@ static void start_ocr(Overlay* o, bool translateToo) {
                 }
                 msg->translated = true;
                 msg->tr = tr;
+                logf(L"图片翻译返回：成功=%d 字符数=%zu 错误=%s",
+                     (int)tr.ok(),tr.text.size(),tr.err.c_str());
             }
         }
         std::lock_guard<std::mutex> lock(keep->jobMutex);
-        if (keep->cancelOcr || !PostMessageW(hwnd, WM_JJ_OCR, 0, (LPARAM)msg)) delete msg;
+        if (keep->cancelOcr || !PostMessageW(hwnd, WM_JJ_OCR, 0, (LPARAM)msg)) {
+            logf(L"图片文字请求结束：截图已取消或窗口已关闭，不再更新结果面板");
+            delete msg;
+        }
         keep->ocrRunning=false;
     }).detach();
 }
 
 static void start_translate(Overlay* o) {
-    if (!o->translateEnabled) return;
+    if (!o->translateEnabled) {logf(L"翻译请求被拒绝：翻译按钮已关闭");return;}
     if (o->panel == PM_LOADING) return;
-    std::wstring text = o->showOriginal ? o->panelOriginal : o->panelBody;
+    std::wstring text = o->panel==PM_TEXT?(o->showOriginal ? o->panelOriginal : o->panelBody):L"";
     if (text.empty()) {
         start_ocr(o, true);
         return;
@@ -1505,6 +1765,8 @@ static void start_translate(Overlay* o) {
     Settings cfg = load_settings();
 
     std::thread([hwnd, keep, text, cfg]() {
+        LogTrace trace(keep->traceId);
+        logf(L"文字翻译请求到达：字符数=%zu",text.size());
         TranslateResult tr;
         // 同上：任何异常都必须在这里被吃掉，否则进程直接没了
         try {
@@ -1519,8 +1781,12 @@ static void start_translate(Overlay* o) {
         msg->tr = tr;
         msg->translated = true;
         msg->text = text;
+        logf(L"文字翻译返回：成功=%d 字符数=%zu 错误=%s",(int)tr.ok(),tr.text.size(),tr.err.c_str());
         std::lock_guard<std::mutex> lock(keep->jobMutex);
-        if (keep->cancelOcr || !PostMessageW(hwnd, WM_JJ_TRANS, 0, (LPARAM)msg)) delete msg;
+        if (keep->cancelOcr || !PostMessageW(hwnd, WM_JJ_TRANS, 0, (LPARAM)msg)) {
+            logf(L"文字翻译请求结束：截图已取消或窗口已关闭，不再更新结果面板");
+            delete msg;
+        }
     }).detach();
 }
 
@@ -1528,7 +1794,7 @@ static void on_ocr_done(Overlay* o, JobMsg* m) {
     if (!m) return;
     if (!m->ok) {
         o->panel = PM_ERROR;
-        o->panelTitle = L"提取文字";
+        o->panelTitle = m->translated ? L"翻译" : L"提取文字";
         o->panelBody = m->err.empty() ? L"识别失败" : m->err;
         o->panelOriginal.clear();
     } else {
@@ -1573,27 +1839,114 @@ static void on_trans_done(Overlay* o, JobMsg* m) {
 }
 
 // ------------------------------------------------------------------ 工具动作
-static void set_tool(Overlay* o, int tool) {
-    o->tool = (o->tool == tool) ? T_NONE : tool;
-    InvalidateRect(o->hwnd, nullptr, FALSE);
+static void set_cursor_for(Overlay* o,POINT pt);
+
+static void end_size_drag(Overlay* o,bool cancelled,const wchar_t* reason){
+    if(!o->sizeDrag.active)return;
+    const auto drag=o->sizeDrag;
+    int current=o->toolSizes[drag.tool-T_RECT];
+    if(cancelled)o->toolSizes[drag.tool-T_RECT]=drag.original;
+    o->sizeDrag.active=false;
+    if(GetCapture()==o->hwnd)ReleaseCapture();
+    InvalidateRect(o->hwnd,&drag.bounds,FALSE);
+    logf(L"右键尺寸拖动结束：工具=%s 原px=%d 拖动px=%d 最终px=%d 取消=%d 原因=%s 调整次数=%d 耗时=%llums；内联滑条已收起",
+        tool_size_name(drag.tool),drag.original,current,o->toolSizes[drag.tool-T_RECT],(int)cancelled,
+        reason,drag.changes,GetTickCount64()-drag.started);
+    overlay_update_brush_cursor(o);
 }
 
-static void undo(Overlay* o) {
-    if (o->anns.empty()) return;
-    o->redos.push_back(o->anns.back());
-    o->anns.pop_back();
-    o->numberSeq = 0;
-    for (auto& a : o->anns) {
-        if (a.kind == AK_NUMBER) o->numberSeq = std::max(o->numberSeq, a.index);
+static void move_size_drag(Overlay* o,POINT pt){
+    auto& drag=o->sizeDrag;
+    if(!drag.active)return;
+    int minimum=tool_size_minimum(drag.tool),maximum=tool_size_maximum(drag.tool);
+    drag.thumb=std::clamp(drag.initial+(float)(pt.x-drag.origin.x),0.0f,drag.length);
+    int next=minimum+(int)lround(drag.thumb/drag.length*(maximum-minimum));
+    int& value=o->toolSizes[drag.tool-T_RECT];
+    if(next!=value){
+        logf(L"右键尺寸调整：工具=%s 起始px=%d 鼠标横向变化=%ldpx 滑块位置=%.1f/%.1f 范围=%d..%d 原px=%d 新px=%d",
+            tool_size_name(drag.tool),drag.original,pt.x-drag.origin.x,drag.thumb,drag.length,
+            minimum,maximum,value,next);
+        value=next;++drag.changes;
     }
+    InvalidateRect(o->hwnd,&drag.bounds,FALSE);
+    set_cursor_for(o,pt);
+}
+
+static bool begin_size_drag(Overlay* o,int tool,POINT pt){
+    logf(L"右键尺寸拖动请求：工具=%d 按下位置=(%ld,%ld) 模式=%d 存在选区=%d",
+        tool,pt.x,pt.y,o->mode,(int)o->hasSel);
+    if(!o->alive||!o->hasSel||o->mode!=0||o->textDrag.kind||o->annotationDrag.active||tool<T_RECT||tool>T_EMOJI){
+        logf(L"右键尺寸拖动被拒绝：当前不是可调整尺寸的标注工具或正在拖选/绘制");return false;
+    }
+    close_emoji_popup(o);close_style_popup(o);commit_text(o);
+    clear_annotation_selection(o,L"调整后续标注的工具尺寸");o->selectedText=-1;
+    SetFocus(o->hwnd);
+    SetCapture(o->hwnd);
+    if(GetCapture()!=o->hwnd){
+        logf(L"右键尺寸拖动失败：无法取得鼠标捕获 error=%lu",GetLastError());return false;
+    }
+    auto& drag=o->sizeDrag;
+    drag={};drag.active=true;drag.tool=tool;drag.origin=pt;drag.original=o->toolSizes[tool-T_RECT];
+    drag.started=GetTickCount64();
+    RECT desktop{0,0,o->shot.vw,o->shot.vh},available=desktop;
+    POINT screen{o->shot.vx+pt.x,o->shot.vy+pt.y};MONITORINFO monitor{sizeof(monitor)};
+    if(GetMonitorInfoW(MonitorFromPoint(screen,MONITOR_DEFAULTTONEAREST),&monitor)){
+        RECT local=monitor.rcMonitor;OffsetRect(&local,-o->shot.vx,-o->shot.vy);
+        RECT visible{};if(IntersectRect(&visible,&desktop,&local))available=visible;
+    }
+    int width=std::min(S(280),(int)(available.right-available.left));
+    int height=std::min(S(76),(int)(available.bottom-available.top));
+    drag.length=(float)std::max(1,width-S(32));
+    drag.initial=drag.thumb=drag.length*(drag.original-tool_size_minimum(tool))/
+        (float)(tool_size_maximum(tool)-tool_size_minimum(tool));
+    int x=std::clamp((int)lround(pt.x-SF(16)-drag.initial),(int)available.left,(int)available.right-width);
+    int y=(o->tbVisible?(int)o->tbY:pt.y)-height-S(10);
+    if(y<available.top)y=(o->tbVisible?(int)(o->tbY+SF(TB_HEIGHT)):pt.y)+S(10);
+    y=std::clamp(y,(int)available.top,(int)available.bottom-height);drag.bounds={x,y,x+width,y+height};
+    o->tool=tool;o->sizeRightConsumed=true;o->hoverItem=-1;
+    hide_stamp_preview(o,L"开始右键拖动尺寸");
+    RECT toolbar{(LONG)floor(o->tbX),(LONG)floor(o->tbY),(LONG)ceil(o->tbX+toolbar_width(o)),
+        (LONG)ceil(o->tbY+SF(TB_HEIGHT))};
+    if(o->tbVisible)InvalidateRect(o->hwnd,&toolbar,FALSE);
+    InvalidateRect(o->hwnd,&drag.bounds,FALSE);
+    set_cursor_for(o,pt);
+    logf(L"右键尺寸拖动开始：工具=%s 原px=%d 范围=%d..%d 滑轨=%.1fpx；不创建大小窗口，松开保存，Esc 撤销",
+        tool_size_name(tool),drag.original,tool_size_minimum(tool),tool_size_maximum(tool),drag.length);
+    return true;
+}
+
+static void set_tool(Overlay* o, int tool) {
+    clear_annotation_selection(o,L"切换标注工具");
+    o->tool = (o->tool == tool) ? T_NONE : tool;
+    if(o->tool!=T_NONE&&o->tool!=T_TEXT)o->selectedText=-1;
+    logf(L"标注工具选择：工具=%d；文字使用系统箭头，不随字号修改鼠标；画笔与马赛克使用截图像素直径",o->tool);
+    overlay_update_brush_cursor(o);
     InvalidateRect(o->hwnd, nullptr, FALSE);
 }
 
-static void redo(Overlay* o) {
-    if(o->redos.empty())return;
-    o->anns.push_back(o->redos.back());o->redos.pop_back();
-    o->numberSeq=0;for(auto&a:o->anns)o->numberSeq=std::max(o->numberSeq,a.index);
-    InvalidateRect(o->hwnd,nullptr,FALSE);
+static void apply_annotation_change(Overlay* o,const AnnotationChange& change,bool forward){
+    clear_annotation_selection(o,L"撤销或重做标注");
+    const auto& value=forward?change.after:change.before;
+    const auto& previous=forward?change.before:change.after;
+    if(value){
+        if(previous)o->anns[change.index]=*value;
+        else o->anns.insert(o->anns.begin()+change.index,*value);
+    }else o->anns.erase(o->anns.begin()+change.index);
+    o->selectedText=-1;o->numberSeq=0;
+    for(const auto& ann:o->anns)if(ann.kind==AK_NUMBER)o->numberSeq=std::max(o->numberSeq,ann.index);
+    overlay_update_brush_cursor(o);InvalidateRect(o->hwnd,nullptr,FALSE);
+}
+static void undo(Overlay* o){
+    commit_text(o);if(o->undoStack.empty())return;
+    auto change=o->undoStack.back();o->undoStack.pop_back();
+    apply_annotation_change(o,change,false);o->redoStack.push_back(change);
+    logf(L"标注撤销：索引=%d 剩余撤销=%zu 可重做=%zu",change.index,o->undoStack.size(),o->redoStack.size());
+}
+static void redo(Overlay* o){
+    commit_text(o);if(o->redoStack.empty())return;
+    auto change=o->redoStack.back();o->redoStack.pop_back();
+    apply_annotation_change(o,change,true);o->undoStack.push_back(change);
+    logf(L"标注重做：索引=%d 可撤销=%zu 剩余重做=%zu",change.index,o->undoStack.size(),o->redoStack.size());
 }
 
 static void cycle_color(Overlay* o) {
@@ -1602,13 +1955,15 @@ static void cycle_color(Overlay* o) {
 }
 
 static void begin_select(Overlay* o, POINT pt) {
+    clear_annotation_selection(o,L"重新选择截图区域");
     o->mode = 1;
     o->dragFrom = pt;
     o->sel.left = pt.x; o->sel.top = pt.y;
     o->sel.right = pt.x + 1; o->sel.bottom = pt.y + 1;
     o->hasSel = true;
     o->anns.clear();
-    o->redos.clear();
+    o->undoStack.clear();o->redoStack.clear();
+    o->selectedText=-1;
     o->hasCur = false;
     o->numberSeq = 0;
     o->hasHover = false;
@@ -1652,6 +2007,22 @@ static LPCWSTR edge_cursor(int mask) {
 }
 
 static void set_cursor_for(Overlay* o, POINT pt) {
+    update_stamp_preview(o,pt);
+    if(o->annotationDrag.active){SetCursor(LoadCursorW(nullptr,IDC_SIZEALL));return;}
+    if(!o->sizeDrag.active){
+        int handle=text_frame_hit(o,pt);Ann text;
+        if(o->textDrag.kind){
+            text=current_text_drag(o);
+            SetCursor(LoadCursorW(nullptr,text_handle_cursor(text,o->textDrag.handle)));return;
+        }
+        if(handle>=0&&selected_text(o,text)){
+            SetCursor(LoadCursorW(nullptr,text_handle_cursor(text,handle)));return;
+        }
+    }
+    if(o->sizeDrag.active){
+        HCURSOR cursor=brush_cursor_at(o,pt)?brush_cursor(o):LoadCursorW(nullptr,IDC_SIZEWE);
+        SetCursor(cursor?cursor:LoadCursorW(nullptr,IDC_SIZEWE));return;
+    }
     // 拖拽中不能再用 hover 判定：光标一直压在刚拖出来的角上，会被认成
     // 控制点，缩放箭头就甩不掉了。先按当前状态分流。
     switch (o->mode) {
@@ -1681,13 +2052,20 @@ static void set_cursor_for(Overlay* o, POINT pt) {
         }
     }
 
-    HICON pc = pointer_cursor();
+    if(brush_cursor_at(o,pt)){
+        HCURSOR cursor=brush_cursor(o);
+        SetCursor(cursor?cursor:pointer_cursor());
+        return;
+    }
+    HICON pc = o->tool==T_TEXT||o->editing ? LoadCursorW(nullptr, IDC_ARROW) : pointer_cursor();
     SetCursor(pc ? pc : LoadCursorW(nullptr, IDC_ARROW));
 }
 
 // ------------------------------------------------------------------ 窗口过程
 static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     Overlay* o = (Overlay*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    std::optional<LogTrace> trace;
+    if (o) trace.emplace(o->traceId);
 
     switch (msg) {
     case WM_CREATE: {
@@ -1695,6 +2073,8 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         o = (Overlay*)cs->lpCreateParams;
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)o);
         o->hwnd = h;
+        o->animationStart=GetTickCount64();o->animationLast=0;
+        SetTimer(h,78,15,nullptr);
         layout_toolbar(o);
         // 覆盖层本身不吃输入法：否则字母快捷键会被 IME 变成 VK_PACKET
         ImmAssociateContext(h, nullptr);
@@ -1702,8 +2082,8 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_SETFOCUS:
-        // 焦点回来时再解绑一次（子编辑框有自己的输入法上下文，不影响中文输入）
-        ImmAssociateContext(h, nullptr);
+        if(o&&o->editing)edit_attach_ime(o);
+        else ImmAssociateContext(h,nullptr);
         return 0;
 
     case WM_ERASEBKGND:
@@ -1736,11 +2116,14 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_CHAR: {
+        if(o&&(o->textDrag.kind||o->annotationDrag.active))return 0;
         if (!o || !o->editing) break;
         wchar_t c = (wchar_t)wp;
         if (c == L'\r' || c == L'\n') { commit_text(o); return 0; }
+        if(c==27&&o->ignoreTextEscape){o->ignoreTextEscape=false;return 0;}
         if (c == 27) { cancel_text(o); return 0; }
         if (c == L'\b') {
+            GetAsyncKeyState(VK_BACK);
             if (!o->editText.empty()) o->editText.pop_back();
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -1762,8 +2145,9 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (imc) {
                 COMPOSITIONFORM cf = {};
                 cf.dwStyle = CFS_POINT;
-                cf.ptCurrentPos.x = o->sel.left + (LONG)o->editPos.X;
-                cf.ptCurrentPos.y = o->sel.top + (LONG)o->editPos.Y + S(20);
+                auto text=editing_text(o);
+                auto point=text.text_point({0,text_line_height((int)text.fontSize)*text.textScaleY});
+                cf.ptCurrentPos.x=o->sel.left+(LONG)point.X;cf.ptCurrentPos.y=o->sel.top+(LONG)point.Y;
                 ImmSetCompositionWindow(imc, &cf);
                 ImmReleaseContext(h, imc);
             }
@@ -1785,7 +2169,20 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
-        if (o && o->editing && wp == TIMER_EDIT) {
+        if(o&&wp==78){
+            uint64_t time=overlay_animation_time(o);
+            for(const auto& a:o->anns)if(a.kind==AK_EMOJI&&a.emojiAnimation&&
+                a.emojiAnimation->frame_index(time)!=a.emojiAnimation->frame_index(o->animationLast)){
+                auto r=a.bounds();RECT dirty{(LONG)floor(r.X)+o->sel.left-2,(LONG)floor(r.Y)+o->sel.top-2,
+                    (LONG)ceil(r.GetRight())+o->sel.left+2,(LONG)ceil(r.GetBottom())+o->sel.top+2};
+                InvalidateRect(h,&dirty,FALSE);
+            }
+            if(o->stampPreviewVisible&&o->stampPreviewKey.emojiAnimation){
+                POINT pt{};GetCursorPos(&pt);ScreenToClient(h,&pt);update_stamp_preview(o,pt);
+            }
+            o->animationLast=time;return 0;
+        }
+        if (o && o->editing && !o->textDrag.kind && !o->annotationDrag.active && wp == TIMER_EDIT) {
             bool composing = ime_composing(h);
             if (GetAsyncKeyState(VK_RETURN) & 0x0001) {
                 if (!composing) { commit_text(o); return 0; }
@@ -1804,6 +2201,7 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_JJ_OCR:
+        if(o&&o->cancelOcr){delete (JobMsg*)lp;logf(L"丢弃已取消的识别结果，不覆盖主开关关闭状态");return 0;}
         if (o) on_ocr_done(o, (JobMsg*)lp);
         return 0;
 
@@ -1813,6 +2211,28 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEMOVE: {
         if (!o) return 0;
+        if(o->annotationDrag.active){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            if(wp&MK_RBUTTON)move_annotation_drag(o,point);
+            else end_annotation_drag(o,false,L"右键已在其他位置松开",false);
+            set_cursor_for(o,point);return 0;
+        }
+        if(o->textDrag.kind){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            if(wp&MK_LBUTTON)move_text_drag(o,point);
+            else end_text_drag(o,false,L"鼠标已松开");
+            set_cursor_for(o,point);return 0;
+        }
+        if(o->sizeDrag.active){
+            if(wp&MK_RBUTTON)move_size_drag(o,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});
+            else end_size_drag(o,false,L"鼠标已在其他位置松开");
+            return 0;
+        }
+        if(o->stampPressed&&!(wp&MK_LBUTTON)){
+            o->stampPressed=false;
+            logf(L"标注按键状态恢复：鼠标已松开，恢复序号/表情落点虚影");
+        }
+        int oldHover=o->hoverItem,oldPanelHover=o->panelBtnHover;
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
 
         if (o->mode == 1) {
@@ -1854,7 +2274,8 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (o->cur.kind == AK_ARROW) {
                 o->cur.b = local;
             } else {
-                o->cur.pts.push_back(local);
+                if(o->cur.pts.empty()||o->cur.pts.back().X!=local.X||o->cur.pts.back().Y!=local.Y)
+                    o->cur.pts.push_back(local);
             }
         } else {
             if (!o->hasSel) {
@@ -1886,12 +2307,16 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         set_cursor_for(o, pt);
-        InvalidateRect(h, nullptr, FALSE);
+        if(o->mode!=0||!o->hasSel||(o->tool!=T_NUMBER&&o->tool!=T_EMOJI)||
+           oldHover!=o->hoverItem||oldPanelHover!=o->panelBtnHover)
+            InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
 
     case WM_MOUSELEAVE:
         if (o) {
+            o->stampPreviewTracking=false;
+            hide_stamp_preview(o,L"指针离开截图覆盖层");
             o->hoverItem = -1;
             o->panelBtnHover = -1;
             InvalidateRect(h, nullptr, FALSE);
@@ -1900,8 +2325,12 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDOWN: {
         if (!o) return 0;
+        if(o->sizeDrag.active||o->annotationDrag.active)return 0;
+        hide_stamp_preview(o,L"按下鼠标，准备放置或操作控件");
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         close_emoji_popup(o);
+        if(text_mouse_down(o,pt))return 0;
+        clear_annotation_selection(o,L"左键绘制或放置新图案");
         commit_text(o);
 
         // 工具条
@@ -1993,7 +2422,9 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 PointF local((float)(pt.x - o->sel.left), (float)(pt.y - o->sel.top));
                 o->cur = Ann();
                 o->cur.color = o->ink;
-                o->cur.width = SF((float)o->toolSizes[o->tool-T_RECT]);
+                o->cur.width = o->annotation_width(o->tool);
+                logf(L"标注笔画开始：工具=%d 设置px=%d 实际宽度=%.2f截图像素",
+                     o->tool,o->toolSizes[o->tool-T_RECT],o->cur.width);
                 if (o->tool == T_RECT) { o->cur.kind = AK_RECT; o->cur.rect = normRect(local.X, local.Y, local.X, local.Y); }
                 else if (o->tool == T_ELLIPSE) { o->cur.kind = AK_ELLIPSE; o->cur.rect = normRect(local.X, local.Y, local.X, local.Y); }
                 else if (o->tool == T_ARROW) { o->cur.kind = AK_ARROW; o->cur.a = local; o->cur.b = local; }
@@ -2001,34 +2432,24 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else { o->cur.kind = AK_MOSAIC; o->cur.pts.push_back(local); ensure_mosaic(o); }
                 o->hasCur = true;
                 o->tbVisible = false;
+                set_cursor_for(o,pt);
                 return 0;
             }
             if (o->tool == T_TEXT) {
                 begin_text(o, pt);
                 return 0;
             }
-            if (o->tool == T_NUMBER) {
-                o->numberSeq += 1;
-                Ann a;
-                a.kind = AK_NUMBER;
-                a.diameter=(float)o->toolSizes[T_NUMBER-T_RECT];
-                a.color = o->ink;
-                a.pos = PointF((float)(pt.x - o->sel.left), (float)(pt.y - o->sel.top));
-                a.index = o->numberSeq;
-                o->redos.clear();
-        a.fontSize=(float)o->toolSizes[T_TEXT-T_RECT];
-        o->anns.push_back(a);
-                InvalidateRect(h, nullptr, FALSE);
-                return 0;
-            }
-            if (o->tool == T_EMOJI) {
-                Ann a;
-                a.kind = AK_EMOJI;
-                a.emojiIndex = o->emojiIndex;
-                a.fontSize = (float)o->toolSizes[T_EMOJI - T_RECT];
-                a.pos = PointF((float)(pt.x - o->sel.left), (float)(pt.y - o->sel.top));
-                o->redos.clear();
-                o->anns.push_back(a);
+            if (o->tool == T_NUMBER || o->tool == T_EMOJI) {
+                Ann a=stamp_annotation(o,{(float)(pt.x-o->sel.left),(float)(pt.y-o->sel.top)});
+                if(a.kind==AK_EMOJI&&!a.emojiImage){
+                    logf(L"图片放置未执行：images 目录没有可用图片，请通过表情按钮选择图片");
+                    show_emoji_picker(o);return 0;
+                }
+                o->stampPressed=true;
+                if(a.kind==AK_NUMBER)o->numberSeq=a.index;
+                add_annotation(o,a);
+                logf(L"序号/表情已放置：工具=%d 序号=%d 表情=%d 中心=(%.0f,%.0f) 实际边长=%.2f截图像素 标注总数=%zu",
+                    o->tool,a.index,a.emojiIndex,a.pos.X,a.pos.Y,a.bounds().Width,o->anns.size());
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
@@ -2045,6 +2466,12 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONUP: {
         if (!o) return 0;
+        if(o->sizeDrag.active||o->annotationDrag.active)return 0;
+        if(o->textDrag.kind){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            move_text_drag(o,point);end_text_drag(o,false,L"左键松开");set_cursor_for(o,point);return 0;
+        }
+        o->stampPressed=false;
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (o->mode == 1) {
             o->sel = normRECT(o->dragFrom.x, o->dragFrom.y, pt.x, pt.y);
@@ -2063,6 +2490,11 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             delete o->mosaic;
             o->mosaic = nullptr;
         } else if (o->mode == 4 && o->hasCur) {
+            if(o->cur.isStroke()){
+                PointF local((float)(pt.x-o->sel.left),(float)(pt.y-o->sel.top));
+                if(o->cur.pts.empty()||o->cur.pts.back().X!=local.X||o->cur.pts.back().Y!=local.Y)
+                    o->cur.pts.push_back(local);
+            }
             bool keep = true;
             if (o->cur.kind == AK_RECT || o->cur.kind == AK_ELLIPSE) {
                 keep = o->cur.rect.Width > 2 || o->cur.rect.Height > 2;
@@ -2070,7 +2502,9 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 float dx = o->cur.b.X - o->cur.a.X, dy = o->cur.b.Y - o->cur.a.Y;
                 keep = (dx * dx + dy * dy) > 4;
             }
-            if (keep) { o->redos.clear(); o->anns.push_back(o->cur); }
+            if (keep) add_annotation(o,o->cur);
+            logf(L"标注笔画结束：类型=%d 宽度=%.2f截图像素 轨迹点=%zu 保留=%d",
+                 (int)o->cur.kind,o->cur.width,o->cur.pts.size(),(int)keep);
             o->hasCur = false;
         }
         o->mode = 0;
@@ -2087,21 +2521,60 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDBLCLK:
         if (o && o->hasSel) {
+            if(o->sizeDrag.active||o->annotationDrag.active||o->textDrag.kind)return 0;
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if(o->editing&&(!o->editText.empty()||!o->composing.empty()||o->editingIndex>=0))return 0;
+            int index=text_at(o,pt);
+            if(index>=0){begin_text(o,pt,index);return 0;}
+            if(o->editing)return 0;
+            if(o->tool>=T_RECT&&o->tool<=T_EMOJI){
+                SendMessageW(h,WM_LBUTTONDOWN,wp,lp);return 0;
+            }
             if (ptInRect(o->sel, pt.x, pt.y)) do_copy(o);
         }
         return 0;
 
-    case WM_RBUTTONUP: {
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDBLCLK: {
         if(!o || !o->hasSel)return 0;
+        if(o->textDrag.kind)return 0;
+        if(o->sizeDrag.active||o->annotationDrag.active)return 0;
+        o->sizeRightConsumed=false;
         POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         int hi=toolbar_hit(o,pt);
-        int tool=hi>=0?o->items[hi].id:o->tool;
-        logf(L"右键 x=%d y=%d tbX=%.0f tbY=%.0f hit=%d tool=%d",pt.x,pt.y,o->tbX,o->tbY,hi,tool);
-        if(tool==T_COLOR){show_color_picker(o);}
-        else if(tool>=T_RECT&&tool<=T_NUMBER){commit_text(o);o->tool=tool;show_tool_slider(o,tool);}
+        int tool=hi>=0?o->items[hi].id:
+            ptInRect(o->sel,pt.x,pt.y)?o->tool:T_NONE;
+        if(hi<0&&o->panel!=PM_HIDDEN&&ptInRectF(o->panelRect,(float)pt.x,(float)pt.y))return 0;
+        if(hi<0&&begin_annotation_drag(o,pt)){set_cursor_for(o,pt);return 0;}
+        if(tool>=T_RECT&&tool<=T_EMOJI)begin_size_drag(o,tool,pt);
         return 0;
     }
+
+    case WM_RBUTTONUP:
+        if(!o)return 0;
+        if(o->annotationDrag.active){
+            POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            move_annotation_drag(o,point);end_annotation_drag(o,false,L"右键松开");
+            o->sizeRightConsumed=false;set_cursor_for(o,point);return 0;
+        }
+        if(o->textDrag.kind)return 0;
+        if(o->sizeDrag.active){
+            move_size_drag(o,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});
+            end_size_drag(o,false,L"右键松开");o->sizeRightConsumed=false;return 0;
+        }
+        if(o->sizeRightConsumed){o->sizeRightConsumed=false;return 0;}
+        if(o->hasSel){
+            POINT pt{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};int hit=toolbar_hit(o,pt);
+            if(hit>=0&&o->items[hit].id==T_COLOR)show_color_picker(o);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if(o&&o->annotationDrag.active&&(HWND)lp!=h)
+            end_annotation_drag(o,true,L"鼠标捕获已转移",false);
+        if(o&&o->sizeDrag.active&&(HWND)lp!=h)end_size_drag(o,true,L"鼠标捕获已转移");
+        if(o&&o->textDrag.kind&&(HWND)lp!=h)end_text_drag(o,true,L"鼠标捕获已转移",false);
+        return 0;
 
     case WM_MOUSEWHEEL: {
         if (!o || o->panel == PM_HIDDEN) return 0;
@@ -2124,7 +2597,31 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_KEYDOWN: {
         if (!o) return 0;
+        if(o->annotationDrag.active){
+            if(wp==VK_ESCAPE){
+                end_annotation_drag(o,true,L"Esc 撤销");o->ignoreTextEscape=o->editing;
+                GetAsyncKeyState(VK_ESCAPE);
+            }
+            return 0;
+        }
+        if(o->textDrag.kind){
+            if(wp==VK_ESCAPE){
+                end_text_drag(o,true,L"Esc 撤销");o->ignoreTextEscape=o->editing;
+                GetAsyncKeyState(VK_ESCAPE);
+            }
+            return 0;
+        }
+        if(o->sizeDrag.active){
+            if(wp==VK_ESCAPE)end_size_drag(o,true,L"Esc 撤销");
+            return 0;
+        }
         if (o->editing) {
+            if(GetKeyState(VK_CONTROL)&0x8000){
+                if(wp=='Z'||wp=='Y'){
+                    if(wp=='Y'||(GetKeyState(VK_SHIFT)&0x8000))redo(o);else undo(o);
+                }else if(wp=='S')do_save(o,(GetKeyState(VK_SHIFT)&0x8000)!=0);
+                else if(wp=='T')do_pin(o);
+            }
             // 回车 / 退格 / Esc 由键盘钩子处理，其余交给输入法
             return 0;
         }
@@ -2134,6 +2631,11 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
         switch (wp) {
         case VK_ESCAPE:
+            if(o->selectedAnnotation>=0){
+                clear_annotation_selection(o,L"Esc 取消图案选择");o->selectedText=-1;
+                InvalidateRect(h,nullptr,FALSE);return 0;
+            }
+            if(o->selectedText>=0){o->selectedText=-1;InvalidateRect(h,nullptr,FALSE);return 0;}
             if (o->panel != PM_HIDDEN) {
                 if(o->ocrRunning)o->cancelOcr=true;
                 o->panel = PM_HIDDEN;
@@ -2153,7 +2655,7 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (ctrl) {
             switch (wp) {
             case 'C': do_copy(o); return 0;
-            case 'S': do_save(o); return 0;
+            case 'S': do_save(o,shift); return 0;
             case 'Z': if(shift)redo(o);else undo(o); return 0;
             case 'Y': redo(o);return 0;
             case 'T': do_pin(o); return 0;
@@ -2181,6 +2683,15 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp == VK_RIGHT) dx = step;
             else if (wp == VK_UP) dy = -step;
             else dy = step;
+            if(o->selectedAnnotation>=0){
+                int index=o->selectedAnnotation;
+                Ann before=o->anns[index],after=before;after.translate((float)dx,(float)dy);
+                invalidate_annotation(o,before);o->anns[index]=after;
+                record_annotation_change(o,index,before,after);select_annotation(o,index);
+                logf(L"图案键盘微调：索引=%d 类型=%s 位移=(%d,%d)截图像素，不移动截图选区",
+                    index,annotation_name(after.kind),dx,dy);
+                return 0;
+            }
             dx=std::clamp(dx,-(int)o->sel.left,o->shot.vw-(int)o->sel.right);
             dy=std::clamp(dy,-(int)o->sel.top,o->shot.vh-(int)o->sel.bottom);
             o->sel.left += dx; o->sel.right += dx;
@@ -2202,15 +2713,35 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
+    case WM_KILLFOCUS:
+    case WM_CANCELMODE:
+        if(o){
+            end_annotation_drag(o,true,msg==WM_KILLFOCUS?L"覆盖层失去焦点":L"操作取消",false);
+            end_text_drag(o,true,msg==WM_KILLFOCUS?L"覆盖层失去焦点":L"操作取消",false);
+            end_size_drag(o,true,msg==WM_KILLFOCUS?L"覆盖层失去焦点":L"操作取消");
+            o->stampPressed=false;
+            hide_stamp_preview(o,L"截图覆盖层失去焦点或操作被取消");
+        }
+        break;
+
     case WM_DESTROY:
         if (o) {
+            end_annotation_drag(o,true,L"覆盖层关闭",false);
+            end_text_drag(o,true,L"覆盖层关闭",false);
+            end_size_drag(o,true,L"覆盖层关闭");
+            logf(L"截图会话结束：存在选区=%d，关闭覆盖层", (int)o->hasSel);
+            o->alive=false;
+            KillTimer(h,78);
+            clear_stamp_preview(o);
+            clear_brush_cursor(o);
+
+            o->input.release();
             close_emoji_popup(o);
             close_style_popup(o);
             std::lock_guard<std::mutex> lock(o->jobMutex);
             o->cancelOcr=true;
             MSG queued;
             while(PeekMessageW(&queued,h,WM_JJ_OCR,WM_JJ_TRANS,PM_REMOVE))delete (JobMsg*)queued.lParam;
-            o->alive = false;
             if (o->editing) edit_poll_stop(h);
             if (o->himc) {
                 ImmAssociateContext(h, nullptr);
@@ -2248,33 +2779,74 @@ bool overlay_is_open() {
     return g_ov && g_ov->alive;
 }
 
+static void apply_overlay_settings(Overlay* o,const Settings& cfg){
+    o->ocrEnabled=cfg.ocr_enabled&&ocr_is_enabled();
+    o->translateEnabled=cfg.translate_enabled;
+    logf(L"截图工具条显示：识别主开关=%d 翻译按钮=%d",
+         (int)o->ocrEnabled,(int)o->translateEnabled);
+}
+
+void overlay_apply_display_settings(const Settings& settings){
+    if(!overlay_is_open())return;
+    auto* o=g_ov.get();
+    if(!settings.ocr_enabled&&o->ocrRunning){
+        o->cancelOcr=true;
+        o->panel=PM_ERROR;o->panelTitle=L"文字识别";
+        o->panelBody=L"识别主开关已关闭，模型已卸载";
+        o->panelOriginal.clear();
+        logf(L"当前识别任务已取消，主开关关闭后不再应用识别结果");
+    }
+    apply_overlay_settings(o,settings);
+    layout_toolbar(o);
+    o->hoverItem=-1;o->panelBtnHover=-1;
+    if(o->hasSel)place_toolbar(o);
+    if(o->panel!=PM_HIDDEN)place_panel(o);
+    InvalidateRect(o->hwnd,nullptr,FALSE);
+    logf(L"已将显示开关应用到当前截图工具条");
+}
+
 bool overlay_open() {
+    LogTrace trace;
+    const ULONGLONG started = GetTickCount64();
+    logf(L"覆盖层请求到达：当前前台=%p", GetForegroundWindow());
     if (overlay_is_open()) {
         logf(L"截图被忽略：覆盖层已存在");
+        return false;
+    }
+    if (capture_requires_elevation(GetForegroundWindow())) {
+        logf(L"截图请求被拦截：前台程序为管理员权限，微截为普通权限，未进入抓屏");
+        app_game_permission_hint();
         return false;
     }
     ensure_class();
 
     auto o = std::make_shared<Overlay>();
+    o->traceId = trace.id();
     Settings cfg = load_settings();
-    o->ocrEnabled = cfg.ocr_enabled &&
-                    (cfg.ocr_engine == L"ppocr" ? fast_ocr_available() :
-                     cfg.ocr_engine == L"hunyuan_fast" ? hunyuan_fast_model_ready() :
-                     hunyuan_model_ready());
-    o->translateEnabled = o->ocrEnabled && cfg.translate_enabled;
+    apply_overlay_settings(o.get(),cfg);
     o->strokeWidth=cfg.stroke_width;o->textSize=cfg.text_size;
     for(int i=0;i<4;++i)o->toolSizes[i]=cfg.stroke_width;
     o->toolSizes[4]=std::clamp(cfg.stroke_width*8,4,120);o->toolSizes[5]=cfg.text_size;
     o->recentColors=load_recent_colors(cfg.recent_colors);
     if(!o->recentColors.empty())o->ink=Color(o->recentColors.front());
-    if (!capture_desktop(o->shot)) {
+    const auto configured=GetTickCount64();
+    if (!capture_desktop(o->shot,cfg)) {
         logf(L"抓屏失败");
         return false;
     }
+    const auto captured=GetTickCount64();
     logf(L"抓屏 %dx%d @ (%d,%d)", o->shot.vw, o->shot.vh, o->shot.vx, o->shot.vy);
 
     g_ov = o;
 
+    // 在覆盖层挡住桌面前探测鼠标下窗口，首帧直接绘制高亮，避免再次枚举和全屏重绘。
+    POINT cur{};
+    RECT wr{};
+    if(GetCursorPos(&cur)&&window_rect_at(cur.x,cur.y,wr)){
+        o->hoverWin={wr.left-o->shot.vx,wr.top-o->shot.vy,wr.right-o->shot.vx,wr.bottom-o->shot.vy};
+        o->hasHover=true;
+    }
+    const auto probed=GetTickCount64();
     HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, OV_CLASS, L"微截",
                                 WS_POPUP | WS_CLIPCHILDREN, o->shot.vx, o->shot.vy, o->shot.vw, o->shot.vh,
                                 nullptr, nullptr, GetModuleHandleW(nullptr), o.get());
@@ -2285,23 +2857,22 @@ bool overlay_open() {
     }
 
     ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-    SetCursor(pointer_cursor());   // 覆盖层一出来就是蓝色箭头，不用等鼠标动
-    {
-        POINT cur{};
-        RECT wr{};
-        if (GetCursorPos(&cur) && window_rect_at(cur.x, cur.y, wr)) {
-            o->hoverWin.left = wr.left - o->shot.vx;
-            o->hoverWin.top = wr.top - o->shot.vy;
-            o->hoverWin.right = wr.right - o->shot.vx;
-            o->hoverWin.bottom = wr.bottom - o->shot.vy;
-            o->hasHover = true;
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
+    const auto created=GetTickCount64();
+    if (!o->input.acquire(hwnd)) {
+        DestroyWindow(hwnd);
+        logf(L"覆盖层请求返回：失败，未能取得游戏窗口的输入焦点，耗时=%llums",
+             GetTickCount64() - started);
+        return false;
     }
-    force_foreground(hwnd);
+    const auto focused=GetTickCount64();
+    UpdateWindow(hwnd);
+    SetCursor(pointer_cursor());
     HWND fg = GetForegroundWindow();
-    logf(L"覆盖层已显示 fg=%p hwnd=%p match=%d", fg, hwnd, (int)(fg == hwnd));
+    logf(L"覆盖层已显示：请求返回成功 fg=%p hwnd=%p match=%d 耗时=%llums",
+         fg, hwnd, (int)(fg == hwnd), GetTickCount64() - started);
+    logf(L"截图唤起分段：设置权限=%llums 抓屏=%llums 窗口命中=%llums 创建显示=%llums 接管输入=%llums 首帧绘制=%llums",
+        configured-started,captured-configured,probed-captured,created-probed,focused-created,
+        GetTickCount64()-focused);
     return true;
 }
 

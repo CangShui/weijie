@@ -102,6 +102,42 @@ std::wstring exe_path() {
     return buf;
 }
 
+bool process_is_elevated(HANDLE process) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    bool elevated = GetTokenInformation(token, TokenElevation, &elevation,
+                                        sizeof(elevation), &size) && elevation.TokenIsElevated;
+    CloseHandle(token);
+    return elevated;
+}
+
+bool capture_requires_elevation(HWND foreground) {
+    if (!foreground || process_is_elevated(GetCurrentProcess())) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        logf(L"截图权限检查：无法查询前台进程 pid=%lu error=%lu，继续尝试普通截图", pid, GetLastError());
+        return false;
+    }
+    bool elevated = process_is_elevated(process);
+    CloseHandle(process);
+    logf(L"截图权限检查：微截=普通权限 前台pid=%lu 前台管理员=%d", pid, (int)elevated);
+    return elevated;
+}
+
+static thread_local unsigned long long currentTrace = 0;
+static std::atomic<unsigned long long> nextTrace{0};
+
+LogTrace::LogTrace(unsigned long long id) : previous_(currentTrace) {
+    id_ = id ? id : (currentTrace ? currentTrace : ++nextTrace);
+    currentTrace = id_;
+}
+
+LogTrace::~LogTrace() { currentTrace = previous_; }
+
 void logf(const wchar_t* fmt, ...) {
     static std::mutex mtx;
     std::lock_guard<std::mutex> lk(mtx);
@@ -118,16 +154,24 @@ void logf(const wchar_t* fmt, ...) {
     _snwprintf_s(head, _countof(head), _TRUNCATE, L"[%02d:%02d:%02d.%03d] ",
                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     line = head;
+    if (currentTrace)
+        line += L"traceId=shot-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                std::to_wstring(currentTrace) + L" ";
     line += buf;
     line += L"\r\n";
 
-    std::wstring path = localappdata_dir() + L"\\app.log";
-    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
-                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
+    std::wstring dir = localappdata_dir() + L"\\logs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t name[64];
+    swprintf_s(name, L"\\audit-dev-%04d-%02d-%02d.log", st.wYear, st.wMonth, st.wDay);
     std::string u8 = w_to_u8(line);
-    SetFilePointer(h, 0, nullptr, FILE_END);
-    WriteFile(h, u8.data(), (DWORD)u8.size(), &wrote, nullptr);
-    CloseHandle(h);
+    // app.log 也是仓库现有 UI 回归脚本的输入。
+    for (const auto& path : {dir + name, localappdata_dir() + L"\\app.log"}) {
+        HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        DWORD wrote = 0;
+        WriteFile(h, u8.data(), (DWORD)u8.size(), &wrote, nullptr);
+        CloseHandle(h);
+    }
 }

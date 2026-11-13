@@ -7,7 +7,10 @@
 #include "ppocr_setup.h"
 #include "longshot.h"
 #include "fast_ocr.h"
+#include "ocr.h"
 #include "ui_theme.h"
+#include "hotkey_input.h"
+#include "autostart.h"
 
 #include <memory>
 #include <atomic>
@@ -24,7 +27,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.5.0-preview"
+#define APP_VERSION L"1.6.0"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101
@@ -33,7 +36,6 @@ static const UINT HOTKEY_ID       = 0xA1;
 static const UINT WM_TRAY         = WM_APP + 1;
 static const UINT WM_ACTIVATE_APP = WM_APP + 2;
 static const wchar_t* WND_CLASS   = L"weijieMsg";
-static const wchar_t* RUN_KEY     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static HINSTANCE g_hinst = nullptr;
 static HWND g_msgwnd = nullptr;
@@ -41,6 +43,11 @@ static HICON g_icon = nullptr;
 static HICON g_iconBig = nullptr;   // 32x32，给窗口类
 static HICON g_iconSm = nullptr;    // 16x16，给窗口类标题栏/任务栏
 static NOTIFYICONDATAW g_nid = {};
+static UINT g_taskbarCreated = 0;
+static bool g_trayRegistered = false;
+static bool g_trayStopping = false;
+static unsigned g_trayAttempts = 0;
+static unsigned long long g_trayTrace = 0;
 static Settings g_cfg;
 static UINT g_hotMods = MOD_ALT, g_hotVk = 0x41;
 static bool g_hotOk = false;
@@ -52,9 +59,12 @@ static DWORD g_lastHotkeyTick = 0;
 static std::atomic<bool> g_watchStop{false};
 static std::thread g_watch;
 static HWND g_settingsWnd = nullptr;
+static RawHotkeyState g_rawKeys;
 
 static const UINT WM_JJ_HOTKEY = WM_APP + 6;
 static const UINT_PTR TIMER_HOTKEY_POLL = 1;
+static const UINT_PTR TIMER_OCR_IDLE = 2;
+static const UINT_PTR TIMER_TRAY_RETRY = 3;
 
 // ------------------------------------------------------------------ 图标
 static HICON make_icon(int size) {
@@ -141,46 +151,42 @@ static HICON load_icon(int size) {
     return h;
 }
 
-// ------------------------------------------------------------------ 自启动
-static bool autostart_enabled() {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
-    wchar_t buf[MAX_PATH * 2] = {0};
-    DWORD size = sizeof(buf);
-    DWORD type = 0;
-    bool on = RegQueryValueExW(k, APP_NAME, nullptr, &type, (LPBYTE)buf, &size) == ERROR_SUCCESS;
-    RegCloseKey(k);
-    return on;
-}
-
-static void set_autostart(bool on) {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &k) != ERROR_SUCCESS) return;
-    if (on) {
-        std::wstring cmd = L"\"" + exe_path() + L"\"";
-        RegSetValueExW(k, APP_NAME, 0, REG_SZ, (const BYTE*)cmd.c_str(),
-                       (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
-    } else {
-        RegDeleteValueW(k, APP_NAME);
-    }
-    RegCloseKey(k);
-}
-
 // ------------------------------------------------------------------ 热键
-// 除 RegisterHotKey 外再挂一层 WH_KEYBOARD_LL：
-// 部分游戏/全屏 UI 用 Raw Input 吃掉了 WM_HOTKEY，低级键盘钩子仍能收到按键。
-// 再以 GetAsyncKeyState 轮询兜底；多路同时触发时用时间戳去重，避免重复打开覆盖层。
+// 系统热键、低级钩子、异步轮询和 Raw Input 共用入口并去重。
+// Raw Input 不安装到游戏进程，也不改变游戏本身的输入注册。
+static bool recording_hotkey() {
+    if(!g_settingsWnd||GetForegroundWindow()!=g_settingsWnd)return false;
+    HWND field=GetDlgItem(g_settingsWnd,100),focus=GetFocus();
+    return field&&IsWindowVisible(field)&&(focus==field||IsChild(field,focus));
+}
+
+static LRESULT CALLBACK hotkey_record_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR){
+    if(msg==WM_SETFOCUS){
+        LogTrace trace;
+        UnregisterHotKey(g_msgwnd,HOTKEY_ID);
+        logf(L"快捷键录入开始：仅在录入框获得焦点时暂停全局快捷键");
+    }else if(msg==WM_KILLFOCUS&&g_cfg.hotkey_enabled){
+        LogTrace trace;
+        UnregisterHotKey(g_msgwnd,HOTKEY_ID);
+        g_hotOk=RegisterHotKey(g_msgwnd,HOTKEY_ID,g_hotMods|MOD_NOREPEAT,g_hotVk)!=FALSE;
+        logf(L"快捷键录入结束：恢复截图快捷键 结果=%d error=%lu",
+             (int)g_hotOk,g_hotOk?ERROR_SUCCESS:GetLastError());
+    }
+    if(msg==WM_NCDESTROY)RemoveWindowSubclass(h,hotkey_record_proc,732);
+    return DefSubclassProc(h,msg,wp,lp);
+}
+
 static bool hotkey_modifiers_match(UINT mods) {
     const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) return false;
     return ctrl == ((mods & MOD_CONTROL) != 0) &&
            alt == ((mods & MOD_ALT) != 0) &&
            shift == ((mods & MOD_SHIFT) != 0);
 }
 
-// 部分全屏游戏会同时绕过 WM_HOTKEY 和 WH_KEYBOARD_LL（直接读 Raw Input）。
-// 主线程定时轮询 GetAsyncKeyState 作为最后一道兜底；30ms 的开销可以忽略。
+// 钩子不可用时，主线程仍以 30ms 间隔检测按键边沿。
 static void poll_hotkey() {
     const bool keyDown = (GetAsyncKeyState(g_hotVk) & 0x8000) != 0;
     const bool newlyDown = keyDown && !g_pollKeyDown;
@@ -189,10 +195,10 @@ static void poll_hotkey() {
         g_hotDown = false;
         return;
     }
-    if (!newlyDown || !g_hotOk || !g_cfg.hotkey_enabled || g_settingsWnd ||
+    if (!newlyDown || !g_hotOk || !g_cfg.hotkey_enabled || recording_hotkey() ||
         g_hotDown || !hotkey_modifiers_match(g_hotMods)) return;
     g_hotDown = true;
-    PostMessageW(g_msgwnd, WM_JJ_HOTKEY, 0, 0);
+    PostMessageW(g_msgwnd, WM_JJ_HOTKEY, 1, (LPARAM)GetTickCount64());
 }
 
 static LRESULT CALLBACK low_level_keyboard_proc(int code, WPARAM wp, LPARAM lp) {
@@ -200,10 +206,10 @@ static LRESULT CALLBACK low_level_keyboard_proc(int code, WPARAM wp, LPARAM lp) 
         auto* info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         if (info && info->vkCode == g_hotVk) {
             if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
-                if (g_hotOk && g_cfg.hotkey_enabled && !g_settingsWnd &&
+                if (g_hotOk && g_cfg.hotkey_enabled && !recording_hotkey() &&
                     !g_hotDown && hotkey_modifiers_match(g_hotMods)) {
                     g_hotDown = true;
-                    PostMessageW(g_msgwnd, WM_JJ_HOTKEY, 0, 0);
+                    PostMessageW(g_msgwnd, WM_JJ_HOTKEY, 0, (LPARAM)GetTickCount64());
                 }
             } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
                 g_hotDown = false;
@@ -221,13 +227,38 @@ static bool install_keyboard_hook() {
     return g_kbHook != nullptr;
 }
 
-static void hotkey_triggered(const wchar_t* source) {
-    if (!g_cfg.hotkey_enabled || g_settingsWnd) return;
+static void hotkey_triggered(const wchar_t* source,ULONGLONG queuedAt=0) {
+    LogTrace trace;
+    logf(L"截图请求到达：来源=%s，快捷键=%s 输入消息排队=%llums",
+        source,g_hotName.c_str(),queuedAt?GetTickCount64()-queuedAt:0);
+    if (!g_cfg.hotkey_enabled || recording_hotkey()) {
+        logf(L"截图请求被拦截：快捷键已关闭或正在快捷键录入框中录入，未进入抓屏");
+        return;
+    }
     const DWORD now = GetTickCount();
-    if ((DWORD)(now - g_lastHotkeyTick) < 400) return;
+    if (g_lastHotkeyTick && (DWORD)(now - g_lastHotkeyTick) < 400) {
+        logf(L"截图请求被拦截：400ms 内的重复输入，未进入抓屏");
+        return;
+    }
     g_lastHotkeyTick = now;
     logf(L"收到热键（%s）", source);
-    overlay_open();
+    bool ok = overlay_open();
+    logf(L"截图请求返回：覆盖层%s", ok ? L"已打开" : L"未打开");
+}
+
+static void install_raw_keyboard() {
+    RAWINPUTDEVICE device{0x01, 0x06, RIDEV_INPUTSINK, g_msgwnd};
+    g_rawKeys.reset();
+    if (!RegisterRawInputDevices(&device, 1, sizeof(device)))
+        logf(L"Raw Input 后台键盘注册失败 error=%lu，保留系统热键、钩子和轮询", GetLastError());
+    else
+        logf(L"Raw Input 后台键盘已注册：只监听截图快捷键，不拦截游戏输入");
+}
+
+static void dispatch_raw_keyboard(const RAWKEYBOARD& input) {
+    bool matched = g_rawKeys.update(input, g_hotMods, g_hotVk);
+    if (matched && g_hotOk && g_cfg.hotkey_enabled && !recording_hotkey())
+        PostMessageW(g_msgwnd, WM_JJ_HOTKEY, 2, (LPARAM)GetTickCount64());
 }
 
 static bool register_preferred(const std::wstring& name) {
@@ -238,6 +269,7 @@ static bool register_preferred(const std::wstring& name) {
  logf(L"尝试热键 %s -> %s",name.c_str(),ok?L"True":L"False");
  if(ok){
   g_hotMods=mods;g_hotVk=vk;g_hotOk=true;g_hotName=name;g_hotDown=false;g_pollKeyDown=false;
+  g_rawKeys.reset();
   install_keyboard_hook();
   return true;
  }
@@ -246,7 +278,39 @@ static bool register_preferred(const std::wstring& name) {
 }
 
 // ------------------------------------------------------------------ 托盘
-static void tray_add() {
+static void tray_try_add() {
+    if (g_trayStopping || g_trayRegistered) return;
+    LogTrace trace(g_trayTrace);
+    ++g_trayAttempts;
+    logf(L"托盘注册执行：第%u次，窗口=%p，图标=%p", g_trayAttempts, g_msgwnd, g_icon);
+    // 同一窗口和 uID 标识同一个图标；重复的任务栏通知只更新已有图标。
+    if (Shell_NotifyIconW(NIM_ADD, &g_nid) ||
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        g_trayRegistered = true;
+        KillTimer(g_msgwnd, TIMER_TRAY_RETRY);
+        logf(L"托盘注册完成：系统已接受图标，尝试次数=%u，已停止重试", g_trayAttempts);
+        NOTIFYICONIDENTIFIER identifier{};
+        identifier.cbSize = sizeof(identifier);
+        identifier.hWnd = g_msgwnd;
+        identifier.uID = g_nid.uID;
+        RECT bounds{};
+        HRESULT location = Shell_NotifyIconGetRect(&identifier, &bounds);
+        logf(L"托盘位置查询：HRESULT=0x%08X，系统返回区域=(%ld,%ld)-(%ld,%ld)",
+             (unsigned)location, bounds.left, bounds.top, bounds.right, bounds.bottom);
+        return;
+    }
+    logf(L"托盘注册未完成：系统通知区域尚未接受图标，2秒后重试；截图快捷键继续可用");
+    if (!SetTimer(g_msgwnd, TIMER_TRAY_RETRY, 2000, nullptr))
+        logf(L"托盘重试定时器创建失败：error=%lu，等待任务栏恢复通知", GetLastError());
+}
+
+static void tray_add(const wchar_t* reason = L"程序启动") {
+    if (g_trayStopping || g_trayRegistered) return;
+    LogTrace trace;
+    g_trayTrace = trace.id();
+    g_trayAttempts = 0;
+    logf(L"托盘注册请求到达：来源=%s", reason);
+    g_nid = {};
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_msgwnd;
     g_nid.uID = 1;
@@ -254,11 +318,50 @@ static void tray_add() {
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_icon;
     wcsncpy_s(g_nid.szTip, APP_NAME, _TRUNCATE);
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    tray_try_add();
 }
 
 static void tray_remove() {
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_trayStopping) return;
+    LogTrace trace(g_trayTrace);
+    g_trayStopping = true;
+    KillTimer(g_msgwnd, TIMER_TRAY_RETRY);
+    if (g_trayRegistered)
+        logf(L"托盘退出清理：移除图标结果=%d", (int)Shell_NotifyIconW(NIM_DELETE, &g_nid));
+    else
+        logf(L"托盘退出清理：图标未注册，已取消等待中的重试");
+    g_trayRegistered = false;
+}
+
+void app_game_permission_hint() {
+    NOTIFYICONDATAW notice = g_nid;
+    notice.uFlags = NIF_INFO;
+    notice.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(notice.szInfoTitle, L"游戏截图需要管理员权限");
+    wcscpy_s(notice.szInfo, L"前台程序以管理员权限运行。请右键微截托盘，选择“以管理员身份重启（游戏截图）”，确认后再回到游戏按截图快捷键。");
+    BOOL shown = g_trayRegistered && Shell_NotifyIconW(NIM_MODIFY, &notice);
+    logf(L"游戏截图权限提示：系统接受通知=%d，使用托盘中的管理员重启入口，需要用户确认 UAC", (int)shown);
+}
+
+static void restart_elevated() {
+    LogTrace trace;
+    logf(L"管理员重启请求到达：来源=托盘，等待用户确认 UAC");
+    std::wstring path = exe_path();
+    SHELLEXECUTEINFOW launch{sizeof(launch)};
+    launch.hwnd = g_msgwnd;
+    launch.lpVerb = L"runas";
+    launch.lpFile = path.c_str();
+    launch.lpParameters = L"--elevated-restart";
+    launch.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&launch)) {
+        DWORD error = GetLastError();
+        logf(L"管理员重启返回：未启动 error=%lu，保留当前微截实例", error);
+        if (error != ERROR_CANCELLED)
+            MessageBoxW(nullptr, L"无法以管理员身份启动微截，请退出后右键程序选择“以管理员身份运行”。",
+                        APP_NAME, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    logf(L"管理员重启返回：新进程已启动，由新实例接管单实例锁");
 }
 
 static void show_tray_menu() {
@@ -276,7 +379,9 @@ static void show_tray_menu() {
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)hk, L"快捷键");
 
     AppendMenuW(menu, MF_STRING, 2, L"设置（截图/OCR/翻译）…");
-    AppendMenuW(menu, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), 3, L"开机自动启动");
+    AppendMenuW(menu, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), 3, L"开机自动启动（管理员）");
+    if (!process_is_elevated(GetCurrentProcess()))
+        AppendMenuW(menu, MF_STRING, 6, L"以管理员身份重启（游戏截图）…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 4, L"关于");
     AppendMenuW(menu, MF_STRING, 5, L"退出");
@@ -300,7 +405,9 @@ static void show_tray_menu() {
         extern void show_settings_dialog(HWND owner);
         show_settings_dialog(g_msgwnd);
     } else if (cmd == 3) {
-        set_autostart(!autostart_enabled());
+        std::wstring error;
+        if(!set_autostart(!autostart_enabled(),error))
+            MessageBoxW(nullptr,error.c_str(),L"开机启动设置失败",MB_OK|MB_ICONWARNING);
     } else if (cmd == 4) {
         std::wstring msg = std::wstring(L"微截 ") + APP_VERSION + L"\n\n"
                            L"微信风格的独立截图工具（原生 C++ 版）。\n"
@@ -309,14 +416,17 @@ static void show_tray_menu() {
         MessageBoxW(nullptr, msg.c_str(), L"关于微截", MB_OK | MB_ICONINFORMATION);
     } else if (cmd == 5) {
         PostMessageW(g_msgwnd, WM_CLOSE, 0, 0);
+    } else if (cmd == 6) {
+        restart_elevated();
     }
 }
 
 // ------------------------------------------------------------------ Settings: compact native tabbed UI.
 struct CfgDlg {
+ double scale=g_scale;
  HWND hwnd{}, tab{}, hotkey{}, monitor{}, saveDir{}, format{}, quality{}, qualityVal{};
  HWND autoCopy{}, includeCursor{}, autostart{}, stroke{}, fontSize{};
- HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{};
+ HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{}, ocrIdle{};
  HWND translateEnabled{};
  HWND base{}, key{}, model{};
  HWND nav[3]{};
@@ -395,8 +505,12 @@ static std::wstring hotkey_name(HWND h){
 }
 static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
  auto*d=(CfgDlg*)GetWindowLongPtrW(h,GWLP_USERDATA);
+ if(msg==WM_CREATE)d=(CfgDlg*)((CREATESTRUCTW*)lp)->lpCreateParams;
+ bool scaled=msg==WM_CREATE||msg==WM_PAINT||msg==WM_PRINTCLIENT||
+             msg==WM_MEASUREITEM||msg==WM_DRAWITEM;
+ UiScaleScope scale(d&&scaled?d->scale:g_scale);
  switch(msg){
- case WM_CREATE:d=(CfgDlg*)((CREATESTRUCTW*)lp)->lpCreateParams;d->hwnd=h;SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)d);cfg_layout(d);return 0;
+ case WM_CREATE:d->hwnd=h;SetWindowLongPtrW(h,GWLP_USERDATA,(LONG_PTR)d);SetPropW(h,L"JjScale",&d->scale);cfg_layout(d);return 0;
  case WM_ERASEBKGND:return 1;
  case WM_PRINTCLIENT:if(d)cfg_paint(d,(HDC)wp);return 0;
  case WM_PAINT:{PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);if(d)cfg_paint(d,dc);EndPaint(h,&ps);return 0;}
@@ -410,6 +524,14 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
   if(!d)return 0;int id=LOWORD(wp);
   if(id==2){DestroyWindow(h);return 0;}
   if(id>=201&&id<=203){d->page=id-201;choose_page(d);return 0;}
+  if(id==14&&HIWORD(wp)==BN_CLICKED&&!checked(d->ocrEnabled)){
+   LogTrace trace;
+   ocr_set_enabled(false);
+   Settings preview=g_cfg;preview.ocr_enabled=false;
+   overlay_apply_display_settings(preview);
+   logf(L"识别主开关已即时关闭并卸载模型；保存后保留关闭状态，取消则恢复原开关但不预加载模型");
+   return 0;
+  }
    if(id==109&&HIWORD(wp)==CBN_SELCHANGE){refresh_download(d);return 0;}
   if(id==10){
    BROWSEINFOW bi{};bi.hwndOwner=h;bi.lpszTitle=L"选择截图保存目录";bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
@@ -427,19 +549,23 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    refresh_download(d);return 0;
   }
   if(id!=1)return 0;
+  LogTrace trace;
+  logf(L"保存设置请求到达：页面=%d OCR启用=%d 所选引擎=%d",
+       d->page, (int)checked(d->ocrEnabled), selected_ocr_engine(d));
   Settings next=g_cfg;next.hotkey_enabled=checked(d->monitor);
   auto hk=hotkey_name(d->hotkey);UINT mods=0,vk=0;
-  if(next.hotkey_enabled&&!resolve_hotkey(hk,mods,vk)){MessageBoxW(h,L"请录入 Ctrl / Alt 组合键，或 F1–F24 / PrintScreen。",L"快捷键无效",MB_OK|MB_ICONWARNING);return 0;}
+  if(next.hotkey_enabled&&!resolve_hotkey(hk,mods,vk)){logf(L"保存设置被拒绝：全局快捷键格式无效，未写入设置");MessageBoxW(h,L"请录入 Ctrl / Alt 组合键，或 F1–F24 / PrintScreen。",L"快捷键无效",MB_OK|MB_ICONWARNING);return 0;}
   if(!hk.empty())next.hotkey=hk;
   next.save_dir=text(d->saveDir);
   if(next.save_dir.empty())next.save_dir=default_save_dir();
-  if(!std::filesystem::path(next.save_dir).is_absolute()){MessageBoxW(h,L"保存位置必须是绝对路径。",L"保存位置",MB_OK);return 0;}
+  if(!std::filesystem::path(next.save_dir).is_absolute()){logf(L"保存设置被拒绝：保存目录不是绝对路径 path=%s，未写入设置",next.save_dir.c_str());MessageBoxW(h,L"保存位置必须是绝对路径。",L"保存位置",MB_OK);return 0;}
   std::error_code ec;std::filesystem::create_directories(next.save_dir,ec);
-  if(ec){MessageBoxW(h,L"无法创建保存目录，请选择有写入权限的文件夹。",L"保存位置",MB_OK);return 0;}
+  if(ec){logf(L"保存设置被拒绝：无法创建保存目录 path=%s error=%d，未写入设置",next.save_dir.c_str(),ec.value());MessageBoxW(h,L"无法创建保存目录，请选择有写入权限的文件夹。",L"保存位置",MB_OK);return 0;}
+  logf(L"保存目录校验通过：path=%s",next.save_dir.c_str());
   auto fi=SendMessageW(d->format,CB_GETCURSEL,0,0);next.image_format=fi==1?L"jpg":fi==2?L"bmp":L"png";
   next.jpeg_quality=(int)SendMessageW(d->quality,TBM_GETPOS,0,0);
   try{next.stroke_width=std::stoi(text(d->stroke));next.text_size=std::stoi(text(d->fontSize));}catch(...){next.stroke_width=0;}
-  if(next.stroke_width<1||next.stroke_width>30||next.text_size<10||next.text_size>72){MessageBoxW(h,L"线宽范围为 1–30，字号范围为 10–72。",L"标注设置",MB_OK);return 0;}
+  if(next.stroke_width<1||next.stroke_width>30||next.text_size<10||next.text_size>72){logf(L"保存设置被拒绝：标注参数无效 线宽=%d 字号=%d，未写入设置",next.stroke_width,next.text_size);MessageBoxW(h,L"线宽范围为 1–30，字号范围为 10–72。",L"标注设置",MB_OK);return 0;}
    next.auto_copy=checked(d->autoCopy);next.include_cursor=checked(d->includeCursor);next.ocr_enabled=checked(d->ocrEnabled);
    next.translate_enabled=checked(d->translateEnabled);
    int engineIndex=(int)SendMessageW(d->ocrEngine,CB_GETCURSEL,0,0);
@@ -447,40 +573,55 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    int backendIndex=(int)SendMessageW(d->ocrBackend,CB_GETCURSEL,0,0);
    LRESULT backend=SendMessageW(d->ocrBackend,CB_GETITEMDATA,backendIndex,0);
    next.ocr_backend=backend==1?L"cpu":backend==2?L"gpu":L"auto";
-  if(next.ocr_engine==L"hunyuan"&&!hunyuan_model_ready()){MessageBoxW(h,L"高精度混元模型尚未下载或校验失败。请先下载模型，或改选快速模型。",L"OCR 设置",MB_OK|MB_ICONWARNING);return 0;}
-  if(next.ocr_engine==L"hunyuan_fast"&&!hunyuan_fast_model_ready()){MessageBoxW(h,L"快速混元模型尚未安装，请先放置 HunyuanOCR-Q3_K_S.gguf。",L"OCR 设置",MB_OK|MB_ICONWARNING);return 0;}
-    if(next.ocr_engine==L"ppocr"&&!fast_ocr_available()){MessageBoxW(h,L"缺少 PP-OCRv6 组件（ocr-ncnn / ocr-fast）。请使用完整程序包。",L"OCR 设置",MB_OK|MB_ICONWARNING);return 0;}
+   int idleIndex=(int)SendMessageW(d->ocrIdle,CB_GETCURSEL,0,0);
+   next.ocr_idle_minutes=(int)SendMessageW(d->ocrIdle,CB_GETITEMDATA,idleIndex,0);
+   logf(L"设置界面读取空闲回收选项：索引=%d 分钟=%d，保存成功后生效",idleIndex,next.ocr_idle_minutes);
+  logf(L"功能设置：识别主开关=%d 翻译按钮=%d；组件在点击功能时检查",
+       (int)next.ocr_enabled,(int)next.translate_enabled);
   next.llm_base=text(d->base);next.llm_key=text(d->key);next.llm_model=text(d->model);
-  if(next.hotkey_enabled&&!register_preferred(next.hotkey)){MessageBoxW(h,L"此快捷键已被占用，未保存更改。请选择另一个组合键。",L"快捷键冲突",MB_OK|MB_ICONWARNING);return 0;}
-  if(!save_settings(next)){UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false;MessageBoxW(h,L"设置文件写入失败，未应用。",L"保存失败",MB_OK);return 0;}
-  g_cfg=next;if(checked(d->autostart)!=autostart_enabled())set_autostart(checked(d->autostart));
+  if(next.hotkey_enabled&&!register_preferred(next.hotkey)){logf(L"保存设置被拒绝：快捷键被占用 hotkey=%s，未写入设置",next.hotkey.c_str());MessageBoxW(h,L"此快捷键已被占用，未保存更改。请选择另一个组合键。",L"快捷键冲突",MB_OK|MB_ICONWARNING);return 0;}
+  if(!save_settings(next)){logf(L"保存设置返回：设置文件写入失败，恢复原快捷键，未应用更改");UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false;if(g_cfg.hotkey_enabled)register_preferred(g_cfg.hotkey);MessageBoxW(h,L"设置文件写入失败，未应用。",L"保存失败",MB_OK);return 0;}
+  g_cfg=next;
+  if(g_cfg.ocr_enabled&&!ocr_is_enabled())ocr_set_enabled(true);
+  overlay_apply_display_settings(g_cfg);
+  if(!g_cfg.hotkey_enabled){UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false;}
+  if(checked(d->autostart)!=autostart_enabled()){
+   std::wstring error;
+   if(!set_autostart(checked(d->autostart),error)){
+    logf(L"保存设置返回：截图设置已写入，但管理员开机启动配置失败，保留设置窗口供重试");
+    std::wstring message=L"其它设置已保存，但开机启动未配置成功。\n\n"+error;
+    MessageBoxW(h,message.c_str(),L"开机启动设置失败",MB_OK|MB_ICONWARNING);return 0;
+   }
+  }
+  logf(L"保存设置返回：成功并应用 保存目录=%s OCR启用=%d 引擎=%s",
+       next.save_dir.c_str(),(int)next.ocr_enabled,next.ocr_engine.c_str());
   DestroyWindow(h);return 0;
  }
  case WM_CLOSE:DestroyWindow(h);return 0;
- case WM_DESTROY:if(d){KillTimer(h,60);d->done=true;}return 0;
+ case WM_DESTROY:if(d){KillTimer(h,60);ocr_set_enabled(g_cfg.ocr_enabled);overlay_apply_display_settings(g_cfg);d->done=true;}return 0;
+ case WM_NCDESTROY:RemovePropW(h,L"JjScale");break;
  }return DefWindowProcW(h,msg,wp,lp);
 }
 void show_settings_dialog(HWND owner){
  if(g_settingsWnd){ShowWindow(g_settingsWnd,SW_SHOW);SetForegroundWindow(g_settingsWnd);return;}
  if(overlay_is_open())return;
  g_cfg=load_settings();
- UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false; // Do not trigger capture while entering a hotkey.
  WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.lpfnWndProc=cfg_proc;wc.hInstance=g_hinst;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
  wc.hbrBackground=ui::canvas_brush();wc.lpszClassName=L"weijieSettings";wc.hIcon=g_iconBig;wc.hIconSm=g_iconSm;RegisterClassExW(&wc);
  RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);
- double savedScale=g_scale;g_scale=std::min(g_scale,std::min((work.bottom-work.top-56)/696.0,(work.right-work.left-40)/872.0));
- CfgDlg d;RECT rect{0,0,S(840),S(648)};AdjustWindowRectEx(&rect,WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_CLIPCHILDREN,FALSE,0);
+ CfgDlg d;d.scale=std::min(g_scale,std::min((work.bottom-work.top-56)/696.0,(work.right-work.left-40)/872.0));
+ RECT rect{0,0,(LONG)lround(840*d.scale),(LONG)lround(648*d.scale)};AdjustWindowRectEx(&rect,WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_CLIPCHILDREN,FALSE,0);
  int w=rect.right-rect.left,h=rect.bottom-rect.top;
  g_settingsWnd=CreateWindowExW(0,L"weijieSettings",L"微截设置",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_CLIPCHILDREN,
   work.left+(work.right-work.left-w)/2,work.top+(work.bottom-work.top-h)/2,w,h,nullptr,nullptr,g_hinst,&d);
  logf(L"settings create hwnd=%p error=%lu",g_settingsWnd,GetLastError()); if(g_settingsWnd){ShowWindow(g_settingsWnd,SW_SHOW);SetForegroundWindow(g_settingsWnd);
   MSG m;while(!d.done){int result=GetMessageW(&m,nullptr,0,0);if(result<=0){if(!result)PostQuitMessage((int)m.wParam);break;}
-   if(!IsDialogMessageW(g_settingsWnd,&m)){TranslateMessage(&m);DispatchMessageW(&m);}}
+   bool settingsMessage=m.hwnd==g_settingsWnd||IsChild(g_settingsWnd,m.hwnd);
+   if(!settingsMessage||!IsDialogMessageW(g_settingsWnd,&m)){TranslateMessage(&m);DispatchMessageW(&m);}}
   if(IsWindow(g_settingsWnd))DestroyWindow(g_settingsWnd);
  }
- if(d.font)DeleteObject(d.font);g_settingsWnd=nullptr;g_scale=savedScale;
- UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false;
- if(g_cfg.hotkey_enabled)register_preferred(g_cfg.hotkey);
+ if(d.font)DeleteObject(d.font);g_settingsWnd=nullptr;
+ if(g_cfg.hotkey_enabled&&!g_hotOk)register_preferred(g_cfg.hotkey);
 }
 
 void app_open_settings() {
@@ -514,8 +655,20 @@ static LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_JJ_HOTKEY:
-        hotkey_triggered(L"低级键盘钩子");
+        hotkey_triggered(wp == 2 ? L"Raw Input" :
+                         wp == 1 ? L"异步按键轮询" : L"低级键盘钩子",(ULONGLONG)lp);
         return 0;
+
+    case WM_INPUT: {
+        RAWINPUT input{};
+        UINT size = sizeof(input);
+        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &input, &size,
+                            sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            input.header.dwType == RIM_TYPEKEYBOARD) {
+            dispatch_raw_keyboard(input.data.keyboard);
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
 
     case WM_JJ_OPEN_SETTINGS:
         if (!overlay_is_open()) show_settings_dialog(g_msgwnd);
@@ -523,13 +676,18 @@ static LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == TIMER_HOTKEY_POLL) poll_hotkey();
+        if (wp == TIMER_OCR_IDLE) ocr_reclaim_idle(GetTickCount64());
+        if (wp == TIMER_TRAY_RETRY) tray_try_add();
         return 0;
 
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
             show_tray_menu();
         } else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
-            overlay_open();
+            LogTrace trace;
+            logf(L"截图请求到达：来源=托盘双击");
+            bool opened=overlay_open();
+            logf(L"托盘双击截图返回：覆盖层已打开=%d",(int)opened);
         }
         return 0;
 
@@ -540,26 +698,55 @@ static LRESULT CALLBACK msg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         show_settings_dialog(g_msgwnd);
         return 0;
 
-    case WM_ACTIVATE_APP:
-        if (!g_settingsWnd) overlay_open();
+    case WM_ACTIVATE_APP: {
+        LogTrace trace;
+        logf(L"截图请求到达：来源=快捷入口或单实例唤起");
+        bool opened=overlay_open();
+        logf(L"快捷入口截图返回：覆盖层已打开=%d",(int)opened);
         return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
 
     case WM_DESTROY:
+        tray_remove();
         KillTimer(h, TIMER_HOTKEY_POLL);
+        KillTimer(h, TIMER_OCR_IDLE);
         PostQuitMessage(0);
         return 0;
     }
 
-    static UINT taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
-    if (msg == taskbar_created) {
-        tray_add();
+    if (g_taskbarCreated && msg == g_taskbarCreated && !g_trayStopping) {
+        g_trayRegistered = false;
+        tray_add(L"任务栏创建或恢复通知");
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+static HWND create_message_window(HINSTANCE hinst) {
+    LogTrace trace;
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    // 隐藏顶层工具窗口接收 Shell 广播，不显示任务栏按钮，也不抢占焦点。
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, WND_CLASS, APP_NAME, WS_POPUP,
+                                 0, 0, 0, 0, nullptr, nullptr, hinst, nullptr);
+    if (!window) {
+        logf(L"后台消息窗口创建失败：error=%lu", GetLastError());
+        return nullptr;
+    }
+    if (!g_taskbarCreated)
+        logf(L"任务栏恢复消息注册失败：error=%lu", GetLastError());
+    else if (!ChangeWindowMessageFilterEx(window, g_taskbarCreated, MSGFLT_ALLOW, nullptr))
+        logf(L"任务栏恢复消息权限配置失败：error=%lu", GetLastError());
+    else
+        logf(L"任务栏恢复接收已就绪：隐藏顶层窗口=%p，允许普通权限 Explorer 通知管理员实例", window);
+    if (!ChangeWindowMessageFilterEx(window, WM_TRAY, MSGFLT_ALLOW, nullptr))
+        logf(L"托盘鼠标消息权限配置失败：error=%lu", GetLastError());
+    else
+        logf(L"托盘鼠标消息接收已就绪：允许 Explorer 回传点击事件");
+    return window;
 }
 
 // ------------------------------------------------------------------ 入口
@@ -597,6 +784,10 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_HOTKEY_CLASS };
     InitCommonControlsEx(&icc);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT comSecurity=CoInitializeSecurity(nullptr,-1,nullptr,nullptr,
+        RPC_C_AUTHN_LEVEL_PKT_PRIVACY,RPC_C_IMP_LEVEL_IMPERSONATE,nullptr,EOAC_NONE,nullptr);
+    if(FAILED(comSecurity)&&comSecurity!=RPC_E_TOO_LATE)
+        logf(L"初始化任务计划 COM 安全上下文失败 HRESULT=0x%08X",(unsigned)comSecurity);
     SetUnhandledExceptionFilter(crash_filter);
 
     Gdiplus::GdiplusStartupInput gsi;
@@ -605,9 +796,37 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
 
     // 单实例
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"weijie_SingleInstance");
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+    DWORD mutexError = GetLastError();
+    if (!mutex) {
+        logf(L"启动被拒绝：无法取得单实例锁 error=%lu，未创建第二个微截实例", mutexError);
+        MessageBoxW(nullptr, mutexError == ERROR_ACCESS_DENIED
+            ? L"微截可能已以管理员身份运行，请从系统托盘使用或退出该实例。"
+            : L"无法创建微截单实例锁，请稍后重试。",
+            APP_NAME, MB_OK | MB_ICONWARNING);
+        Gdiplus::GdiplusShutdown(token);
+        return 1;
+    }
+    bool existingInstance = mutexError == ERROR_ALREADY_EXISTS;
+    if (existingInstance && wcsstr(GetCommandLineW(), L"--elevated-restart") &&
+        process_is_elevated(GetCurrentProcess())) {
+        HWND existing = FindWindowExW(nullptr, nullptr, WND_CLASS, nullptr);
+        logf(L"管理员实例接管开始：通知旧实例正常退出 hwnd=%p", existing);
+        if (existing) PostMessageW(existing, WM_APP + 4, 0, 0);
+        DWORD wait = WaitForSingleObject(mutex, 10000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            logf(L"管理员实例接管失败：旧实例未退出 wait=%lu，未强制终止旧进程", wait);
+            MessageBoxW(nullptr, L"旧版微截尚未退出，请从托盘退出后重新以管理员身份运行。",
+                        APP_NAME, MB_OK | MB_ICONWARNING);
+            CloseHandle(mutex);
+            Gdiplus::GdiplusShutdown(token);
+            return 1;
+        }
+        existingInstance = false;
+        logf(L"管理员实例接管完成：已取得单实例锁");
+    }
+    if (existingInstance) {
         if(wcsstr(GetCommandLineW(),L"--quit")){
-            HWND existing=FindWindowExW(HWND_MESSAGE,nullptr,WND_CLASS,nullptr);
+            HWND existing=FindWindowExW(nullptr,nullptr,WND_CLASS,nullptr);
             if(existing)PostMessageW(existing,WM_APP+4,0,0);
             CloseHandle(mutex);Gdiplus::GdiplusShutdown(token);return 0;
         }
@@ -625,7 +844,14 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     if(wcsstr(GetCommandLineW(),L"--quit")){if(mutex)CloseHandle(mutex);Gdiplus::GdiplusShutdown(token);return 0;}
     init_dpi();
     g_cfg = load_settings();
+    ocr_set_enabled(g_cfg.ocr_enabled);
+    ocr_set_idle_timeout(g_cfg.ocr_idle_minutes);
     logf(L"启动 %s，exe=%s", APP_VERSION, exe_path().c_str());
+    logf(L"运行权限：管理员=%d", (int)process_is_elevated(GetCurrentProcess()));
+    logf(L"启动来源：%s",wcsstr(GetCommandLineW(),L"--autostart")?L"管理员登录任务":L"手动启动");
+    std::wstring startupError;
+    if(!migrate_legacy_autostart(startupError))
+        MessageBoxW(nullptr,startupError.c_str(),L"开机启动升级失败",MB_OK|MB_ICONWARNING);
 
     // 注册消息窗口类
     g_iconBig = load_icon(GetSystemMetrics(SM_CXICON));
@@ -640,15 +866,17 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     wc.hIconSm = g_iconSm;
     RegisterClassExW(&wc);
 
-    g_msgwnd = CreateWindowExW(0, WND_CLASS, APP_NAME, 0, 0, 0, 0, 0,
-                               HWND_MESSAGE, nullptr, hinst, nullptr);
+    g_msgwnd = create_message_window(hinst);
     if (!g_msgwnd) return 1;
 
     g_icon = g_iconSm ? g_iconSm : make_icon(GetSystemMetrics(SM_CXSMICON));
     tray_add();
+    if (capture_requires_elevation(GetForegroundWindow())) app_game_permission_hint();
 
     install_keyboard_hook();
+    install_raw_keyboard();
     SetTimer(g_msgwnd, TIMER_HOTKEY_POLL, 30, nullptr);
+    SetTimer(g_msgwnd, TIMER_OCR_IDLE, 1000, nullptr);
     if (g_cfg.hotkey_enabled && !register_preferred(g_cfg.hotkey)) {
         MessageBoxW(nullptr,L"截图快捷键被占用，请在设置中更换。",APP_NAME,MB_OK|MB_ICONWARNING);
     }
@@ -675,8 +903,11 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     if (g_watch.joinable()) g_watch.join();
     ppocr_download_shutdown();
     hunyuan_download_shutdown();
+    ocr_set_enabled(false);
     fast_ocr_shutdown();
     if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+    RAWINPUTDEVICE rawRemove{0x01, 0x06, RIDEV_REMOVE, nullptr};
+    RegisterRawInputDevices(&rawRemove, 1, sizeof(rawRemove));
     tray_remove();
     longshot_close_previews();
     pin_close_all();

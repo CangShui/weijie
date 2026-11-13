@@ -9,8 +9,8 @@
 IDI_APP ICON "../assets/icon.ico"
 
 1 VERSIONINFO
- FILEVERSION    1,5,0,0
- PRODUCTVERSION 1,5,0,0
+ FILEVERSION    1,6,0,0
+ PRODUCTVERSION 1,6,0,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L
@@ -23,12 +23,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "weijie"
             VALUE "FileDescription",  "微截 - 微信风格截图工具"
-            VALUE "FileVersion",      "1.5.0.0"
+            VALUE "FileVersion",      "1.6.0.0"
             VALUE "InternalName",     "weijie"
             VALUE "LegalCopyright",   "Copyright (C) 2026"
             VALUE "OriginalFilename", "微截.exe"
             VALUE "ProductName",      "微截"
-            VALUE "ProductVersion",   "1.5.0.0"
+            VALUE "ProductVersion",   "1.6.0.0"
         END
     END
     BLOCK "VarFileInfo"

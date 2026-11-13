@@ -12,6 +12,8 @@ struct Shot {
 };
 
 bool capture_desktop(Shot& s);
+struct Settings;
+bool capture_desktop(Shot& s,const Settings& settings);
 void free_shot(Shot& s);
 
 // 屏幕坐标 -> 该点所在的顶层窗口矩形（屏幕坐标）

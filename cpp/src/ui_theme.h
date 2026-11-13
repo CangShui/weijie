@@ -58,7 +58,65 @@ inline void round_window(HWND h, int radius=12) {
 inline std::wstring caption(HWND h) {
     int n=GetWindowTextLengthW(h);std::wstring s(n+1,L'\0');GetWindowTextW(h,s.data(),n+1);s.resize(n);return s;
 }
+struct TrackbarGeometry {
+    RECT channel{},thumb{};
+    float cx=0,cy=0,radius=7;
+};
+inline TrackbarGeometry trackbar_geometry(HWND h){
+    TrackbarGeometry geometry;
+    SendMessageW(h,TBM_GETCHANNELRECT,0,(LPARAM)&geometry.channel);
+    SendMessageW(h,TBM_GETTHUMBRECT,0,(LPARAM)&geometry.thumb);
+    int minimum=(int)SendMessageW(h,TBM_GETRANGEMIN,0,0),maximum=(int)SendMessageW(h,TBM_GETRANGEMAX,0,0);
+    int position=(int)SendMessageW(h,TBM_GETPOS,0,0);
+    geometry.cx=geometry.channel.left+(geometry.channel.right-geometry.channel.left)*
+        (position-minimum)/(float)std::max(1,maximum-minimum);
+    auto visualX=(INT_PTR)GetPropW(h,L"JjSliderVisualX");
+    auto visualValue=(INT_PTR)GetPropW(h,L"JjSliderVisualValue");
+    if(visualX&&visualValue&&visualValue-1==position)geometry.cx=(float)(visualX-1);
+    geometry.cy=(geometry.thumb.top+geometry.thumb.bottom)/2.0f;
+    auto* scale=(const double*)GetPropW(GetAncestor(h,GA_ROOT),L"JjScale");
+    geometry.radius=(float)(7*(scale?*scale:g_scale));
+    return geometry;
+}
+inline void trackbar_notify(HWND h,UINT code){
+    int position=(int)SendMessageW(h,TBM_GETPOS,0,0);
+    SendMessageW(GetParent(h),WM_HSCROLL,MAKEWPARAM(code,position),(LPARAM)h);
+}
+inline bool trackbar_mouse_position(HWND h,int x){
+    auto geometry=trackbar_geometry(h);
+    int minimum=(int)SendMessageW(h,TBM_GETRANGEMIN,0,0),maximum=(int)SendMessageW(h,TBM_GETRANGEMAX,0,0);
+    double fraction=std::clamp((x-geometry.channel.left)/(double)std::max(1L,geometry.channel.right-geometry.channel.left),0.0,1.0);
+    int position=minimum+(int)lround(fraction*(maximum-minimum));
+    int previous=(int)SendMessageW(h,TBM_GETPOS,0,0);
+    if(position!=previous){
+        SendMessageW(h,TBM_SETPOS,FALSE,position);
+    }
+    int visualX=std::clamp(x,(int)geometry.channel.left,(int)geometry.channel.right);
+    SetPropW(h,L"JjSliderVisualX",(HANDLE)(INT_PTR)(visualX+1));
+    SetPropW(h,L"JjSliderVisualValue",(HANDLE)(INT_PTR)(position+1));
+    InvalidateRect(h,nullptr,FALSE);
+    UpdateWindow(h);
+    if(position!=previous){
+        logf(L"滑条鼠标数值更新：控件=%d 横坐标=%d 绘制中心=%d 范围=%d..%d 原值=%d 新值=%d",
+             GetDlgCtrlID(h),x,visualX,minimum,maximum,previous,position);
+        trackbar_notify(h,TB_THUMBTRACK);
+    }
+    return position!=previous;
+}
+inline void trackbar_end_mouse(HWND h,bool cancelled){
+    RemovePropW(h,L"JjSliderDragging");RemovePropW(h,L"JjSliderOffset");
+    if(GetCapture()==h)ReleaseCapture();
+    if(!cancelled)trackbar_notify(h,TB_THUMBPOSITION);
+    trackbar_notify(h,TB_ENDTRACK);
+    logf(L"滑条鼠标交互返回：控件=%d 取消=%d 当前值=%ld 捕获已释放=%d",
+         GetDlgCtrlID(h),(int)cancelled,(long)SendMessageW(h,TBM_GETPOS,0,0),(int)(GetCapture()!=h));
+    RemovePropW(h,L"JjSliderTrace");
+}
 inline LRESULT CALLBACK control_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR kind) {
+    if(kind==4&&(m==TBM_SETPOS||m==TBM_SETRANGE||m==TBM_SETRANGEMIN||m==TBM_SETRANGEMAX||
+                m==WM_KEYDOWN||m==WM_MOUSEWHEEL||m==WM_SIZE)){
+        RemovePropW(h,L"JjSliderVisualX");RemovePropW(h,L"JjSliderVisualValue");
+    }
     if(m==WM_MOUSEMOVE) {
         if(!GetPropW(h,L"JjHover")) {
             SetPropW(h,L"JjHover",(HANDLE)1);
@@ -66,6 +124,39 @@ inline LRESULT CALLBACK control_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DW
         }
     }
     if(m==WM_MOUSELEAVE){RemovePropW(h,L"JjHover");InvalidateRect(h,nullptr,FALSE);}
+    if(kind==4){
+        if((m==WM_LBUTTONDOWN||m==WM_LBUTTONDBLCLK)&&IsWindowEnabled(h)){
+            LogTrace trace;
+            SetFocus(h);
+            auto geometry=trackbar_geometry(h);
+            int x=GET_X_LPARAM(l),y=GET_Y_LPARAM(l);
+            float dx=x-geometry.cx,dy=y-geometry.cy,radius=geometry.radius+1;
+            bool onThumb=dx*dx+dy*dy<=radius*radius;
+            SetCapture(h);
+            if(GetCapture()!=h){
+                logf(L"滑条鼠标请求被拒绝：控件=%d 无法取得鼠标捕获 error=%lu",GetDlgCtrlID(h),GetLastError());
+                return 0;
+            }
+            SetPropW(h,L"JjSliderDragging",(HANDLE)1);
+            SetPropW(h,L"JjSliderTrace",(HANDLE)(ULONG_PTR)trace.id());
+            SetPropW(h,L"JjSliderOffset",(HANDLE)(INT_PTR)(onThumb?x-(int)lround(geometry.cx):0));
+            logf(L"滑条鼠标请求到达：控件=%d 点击=(%d,%d) 命中滑块=%d 当前值=%ld",
+                 GetDlgCtrlID(h),x,y,(int)onThumb,(long)SendMessageW(h,TBM_GETPOS,0,0));
+            if(onThumb)trackbar_notify(h,TB_THUMBTRACK);
+            else if(!trackbar_mouse_position(h,x))trackbar_notify(h,TB_THUMBTRACK);
+            return 0;
+        }
+        if((m==WM_MOUSEMOVE||m==WM_LBUTTONUP)&&GetPropW(h,L"JjSliderDragging")){
+            LogTrace trace((unsigned long long)(ULONG_PTR)GetPropW(h,L"JjSliderTrace"));
+            trackbar_mouse_position(h,GET_X_LPARAM(l)-(int)(INT_PTR)GetPropW(h,L"JjSliderOffset"));
+            if(m==WM_LBUTTONUP)trackbar_end_mouse(h,false);
+            return 0;
+        }
+        if((m==WM_CAPTURECHANGED||m==WM_CANCELMODE)&&GetPropW(h,L"JjSliderDragging")){
+            LogTrace trace((unsigned long long)(ULONG_PTR)GetPropW(h,L"JjSliderTrace"));
+            trackbar_end_mouse(h,true);return 0;
+        }
+    }
     if(m==WM_SETFOCUS||m==WM_KILLFOCUS||m==WM_ENABLE||m==BM_SETCHECK||m==BM_SETSTATE||
        m==TBM_SETPOS||m==WM_LBUTTONDOWN||m==WM_LBUTTONUP||m==WM_KEYUP) {
         LRESULT r=DefSubclassProc(h,m,w,l);InvalidateRect(h,nullptr,FALSE);return r;
@@ -74,6 +165,8 @@ inline LRESULT CALLBACK control_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DW
     // 之前统一返回 1 会让热键控件透出上一页残留的文字和绿色提示块。
     if(m==WM_ERASEBKGND)return kind==3?DefSubclassProc(h,m,w,l):1;
     if((m==WM_PAINT&&kind!=3)||m==WM_PRINTCLIENT) {
+        auto* windowScale=(const double*)GetPropW(GetAncestor(h,GA_ROOT),L"JjScale");
+        UiScaleScope scale(windowScale?*windowScale:g_scale);
         PAINTSTRUCT ps{};HDC dc=m==WM_PAINT?BeginPaint(h,&ps):(HDC)w;RECT rc;GetClientRect(h,&rc);
         if(rc.right>0&&rc.bottom>0){
             Bitmap bmp(rc.right,rc.bottom,PixelFormat32bppARGB);
@@ -126,9 +219,10 @@ inline LRESULT CALLBACK control_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DW
                 float part=std::clamp((pos-range.iLow)/(float)std::max(1,range.iHigh-range.iLow),0.0f,1.0f);
                 if(part>0)box(g,RectF(0,0,rc.right*part,(REAL)rc.bottom),green(),3);
             } else if(kind==4) { // Win32 trackbar, with custom track and thumb
-                RECT ch{},th{};SendMessageW(h,TBM_GETCHANNELRECT,0,(LPARAM)&ch);SendMessageW(h,TBM_GETTHUMBRECT,0,(LPARAM)&th);
+                auto geometry=trackbar_geometry(h);
+                RECT ch=geometry.channel;
                 float x=(float)ch.left, width=(float)(ch.right-ch.left);
-                float cy=rc.bottom/2.0f, cx=(th.left+th.right)/2.0f;
+                float cy=geometry.cy,cx=geometry.cx;
                 int gradient=(int)(INT_PTR)GetPropW(h,L"JjGradient");
                 RectF track(x,cy-SF(2),width,SF(4));
                 if(gradient==1) {
@@ -164,6 +258,8 @@ inline LRESULT CALLBACK control_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DW
     if(m==WM_NCDESTROY) {
         RemovePropW(h,L"JjHover");RemovePropW(h,L"JjPrimary");RemovePropW(h,L"JjNav");
         RemovePropW(h,L"JjSelected");RemovePropW(h,L"JjGradient");RemovePropW(h,L"JjColor");RemovePropW(h,L"JjCanvas");
+        RemovePropW(h,L"JjSliderDragging");RemovePropW(h,L"JjSliderOffset");RemovePropW(h,L"JjSliderTrace");
+        RemovePropW(h,L"JjSliderVisualX");RemovePropW(h,L"JjSliderVisualValue");
         RemoveWindowSubclass(h,control_proc,731);
     }
     return DefSubclassProc(h,m,w,l);
