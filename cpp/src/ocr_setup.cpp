@@ -19,8 +19,8 @@ struct Asset {
 
 const Asset kQ8{L"HunyuanOCR-Q8_0.gguf", 577949408ull,
                 L"cdafc794cafeae377868d7a40a70e282a737e39abe77c0d8b73614447b364a21"};
-const Asset kQ3{L"HunyuanOCR-Q3_K_S.gguf", 285220352ull,
-                L"b44649df28d7c743e2ddecff23ae39fb1f7c4639da6796214ea23ee89574725b"};
+const Asset kQ3{L"HunyuanOCR-Q3_K_S.gguf", 285219968ull,
+                L"a680d193fd9ca025e7d0e73a27795f0a25fc2d521fe6fe91171575851c3a0447"};
 const Asset kMmproj{L"mmproj-HunyuanOCR-Q8_0.gguf", 732938240ull,
                     L"b77913164ff73d4c0dc4d994e236ed72bacbbe5c5db1ec9b2828627b46c32804"};
 
