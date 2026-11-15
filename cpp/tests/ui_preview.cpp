@@ -10,7 +10,7 @@ static std::wstring preview_images_exe_path(){return imageTestExe.empty()?exe_pa
 #include "../src/emoji_renderer.cpp"
 #undef exe_path
 // 组件状态和设置提示由测试控制，不修改本机模型或等待人工确认。
-static int readinessChecks[3]{};
+static int readinessChecks[1]{};
 static bool componentReady=false;
 static int ocrWarnings=0,unexpectedWarnings=0;
 static int captureRequests=0;
@@ -44,8 +44,6 @@ static int WINAPI preview_settings_message_box(HWND,LPCWSTR message,LPCWSTR titl
     logf(L"设置回归提示：标题=%s 内容=%s",title?title:L"",message?message:L"");
     return IDOK;
 }
-#define hunyuan_model_ready preview_hunyuan_model_ready
-#define hunyuan_fast_model_ready preview_hunyuan_fast_model_ready
 #define fast_ocr_available preview_fast_ocr_available
 #define MessageBoxW preview_settings_message_box
 #define overlay_open preview_capture_request
@@ -58,8 +56,6 @@ static int WINAPI preview_settings_message_box(HWND,LPCWSTR message,LPCWSTR titl
 #undef SetTimer
 #undef Shell_NotifyIconW
 #undef wWinMain
-#undef hunyuan_model_ready
-#undef hunyuan_fast_model_ready
 #undef fast_ocr_available
 #undef MessageBoxW
 #undef overlay_open
@@ -122,9 +118,7 @@ static bool preview_longshot_copy(Gdiplus::Bitmap*){++longshotCopies;return long
 #undef copy_bitmap_to_clipboard
 #undef MessageBoxW
 
-bool preview_hunyuan_model_ready(){++readinessChecks[0];return componentReady;}
-bool preview_hunyuan_fast_model_ready(){++readinessChecks[1];return componentReady;}
-bool preview_fast_ocr_available(){++readinessChecks[2];return componentReady;}
+bool preview_fast_ocr_available(){++readinessChecks[0];return componentReady;}
 static std::atomic<int> recognized{0},translated{0};
 static bool preview_ocr_recognize(Gdiplus::Bitmap*,std::wstring& text,std::wstring& error,const std::atomic<bool>*){
     ++recognized;
@@ -169,9 +163,9 @@ static bool png(HWND window,const std::wstring& path) {
 
 static bool test_settings_save(const std::filesystem::path& output,const wchar_t* windowClass){
     Settings original=g_cfg;
-    const wchar_t* engines[]={L"hunyuan",L"hunyuan_fast",L"ppocr"};
+    const wchar_t* engines[]={L"ppocr"};
     bool allPassed=true;
-    for(int engine=0;engine<3;++engine)for(int scenario=0;scenario<3;++scenario){
+    for(int engine=0;engine<1;++engine)for(int scenario=0;scenario<3;++scenario){
         LogTrace trace;
         bool enabled=scenario!=0;
         componentReady=scenario==2;
@@ -191,12 +185,11 @@ static bool test_settings_save(const std::filesystem::path& output,const wchar_t
         auto nextDir=output/(L"保存目录-"+std::to_wstring(engine)+L"-"+std::to_wstring(scenario));
         SetWindowTextW(dlg.saveDir,nextDir.c_str());
         SendMessageW(dlg.ocrEnabled,BM_SETCHECK,enabled?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(dlg.ocrEngine,CB_SETCURSEL,engine,0);
         dlg.page=1;choose_page(&dlg);
-        std::fill_n(readinessChecks,3,0);ocrWarnings=0;unexpectedWarnings=0;
+        std::fill_n(readinessChecks,1,0);ocrWarnings=0;unexpectedWarnings=0;
         SendMessageW(form,WM_COMMAND,MAKEWPARAM(1,BN_CLICKED),0);
         Settings stored=load_settings();
-        int totalChecks=readinessChecks[0]+readinessChecks[1]+readinessChecks[2];
+        int totalChecks=readinessChecks[0];
         bool ok=unexpectedWarnings==0&&totalChecks==0&&ocrWarnings==0&&dlg.done&&
             stored.ocr_enabled==enabled&&stored.ocr_engine==engines[engine]&&
             stored.save_dir==nextDir.wstring()&&g_cfg.save_dir==stored.save_dir;

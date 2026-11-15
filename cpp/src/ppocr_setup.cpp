@@ -11,11 +11,27 @@
 
 namespace {
 
-constexpr wchar_t kPackageUrl[] =
-    L"https://github.com/CangShui/weijie/releases/download/models/weijie-ocr-ncnn.zip";
-constexpr unsigned long long kPackageSize = 146397538ull;
-constexpr wchar_t kPackageSha256[] =
-    L"d9c9a0c098fde203f3078baee02d68850e1d60f70ada51642b606c6e4f658ad7";
+constexpr wchar_t kPackageBase[] =
+    L"https://github.com/CangShui/weijie/releases/download/models/";
+
+struct Package {
+    const wchar_t* name;
+    unsigned long long size;
+    const wchar_t* hash;
+    bool runtime;
+};
+
+// 运行时与三档模型分开发布，安装时逐包下载、校验、解压。
+const Package kPackages[] = {
+    {L"weijie-ocr-ncnn.zip", 27243945ull,
+     L"93472f2934ed57e9a0c62e88b5b8a478e67e5c9e5c706c2bab2e88df17566a36", true},
+    {L"PP-OCRv6-tiny.zip", 5693359ull,
+     L"5261fbc5d5e0bf806da445def1adbc85dbee86896bff68b50da4ada84cd9a3ad", false},
+    {L"PP-OCRv6-small.zip", 12249612ull,
+     L"ba7c95185578ea2f09fbb797084122735ff0224b40fffbff2936324c8f70ba00", false},
+    {L"PP-OCRv6-medium.zip", 100750366ull,
+     L"846fec16eca607e504f9e87576a8cdfc4fb248dab913418d5d74a3f408b77bc7", false},
+};
 
 std::thread worker;
 std::atomic<bool> cancel{false};
@@ -53,9 +69,9 @@ bool dir_ready(const std::wstring& dir) {
     return true;
 }
 
-bool extract_package(const std::wstring& zip, const std::wstring& dest) {
+bool extract_package(const std::wstring& zip, const std::wstring& dest, bool clean) {
     std::error_code ec;
-    std::filesystem::remove_all(dest, ec);
+    if (clean) std::filesystem::remove_all(dest, ec);
     std::filesystem::create_directories(dest, ec);
     if (ec) return false;
     std::wstring cmd = L"tar.exe -xf \"" + zip + L"\" -C \"" + dest + L"\"";
@@ -73,7 +89,7 @@ bool extract_package(const std::wstring& zip, const std::wstring& dest) {
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    return code == 0 && dir_ready(dest);
+    return code == 0;
 }
 
 }  // namespace
@@ -88,7 +104,7 @@ bool ppocr_component_ready() {
 
 std::wstring ppocr_component_status_text() {
     if (ppocr_component_ready()) return L"PP-OCRv6 已安装：tiny / small / medium 三档可选。";
-    return L"OCR 组件未安装。点击下方按钮下载组件和 PP-OCRv6 模型。";
+    return L"OCR 组件未安装。点击下方按钮下载运行时与 PP-OCRv6 三档模型（约 146 MB）。";
 }
 
 PpOcrDownloadState ppocr_download_state() {
@@ -116,39 +132,49 @@ void ppocr_download_async() {
     }
     worker = std::thread([] {
         LogTrace trace;
-        logf(L"PP-OCR 组件下载请求到达");
+        logf(L"PP-OCR 组件下载请求到达：运行时 + 三档模型");
+        unsigned long long total = 0;
+        for (const Package& pkg : kPackages) total += pkg.size;
         try {
             std::filesystem::create_directories(models_dir());
-            const std::wstring zip = models_dir() + L"\\weijie-ocr-ncnn.zip";
             std::atomic<unsigned long long> done{0};
-            std::wstring error;
-            bool ok = download_file(kPackageUrl, zip, kPackageSize, cancel,
-                                    [&](unsigned long long bytes) {
-                                        done += bytes;
-                                        int percent = (int)(done.load() * 90 / kPackageSize);
-                                        update(L"正在下载 OCR 组件  " + human_size(done.load()) +
-                                                   L" / " + human_size(kPackageSize),
-                                               percent);
-                                    },
-                                    error);
-            if (!ok) {
+            for (const Package& pkg : kPackages) {
                 if (cancel) throw std::runtime_error("cancel");
-                logf(L"PP-OCR 组件下载失败：%s", error.c_str());
-                throw std::runtime_error("download");
+                const std::wstring zip = models_dir() + L"\\" + pkg.name;
+                std::wstring error;
+                update(L"正在下载 " + std::wstring(pkg.name) + L"  " +
+                           human_size(done.load()) + L" / " + human_size(total),
+                       total ? (int)(done.load() * 90 / total) : 0);
+                const std::wstring url = std::wstring(kPackageBase) + pkg.name;
+                bool ok = download_file(url, zip, pkg.size, cancel,
+                                        [&](unsigned long long bytes) {
+                                            done += bytes;
+                                            int percent = total ? (int)(done.load() * 90 / total) : 0;
+                                            update(L"正在下载 " + std::wstring(pkg.name) + L"  " +
+                                                       human_size(done.load()) + L" / " + human_size(total),
+                                                   percent);
+                                        },
+                                        error);
+                if (!ok) {
+                    if (cancel) throw std::runtime_error("cancel");
+                    logf(L"PP-OCR 组件下载失败：文件=%s 原因=%s", pkg.name, error.c_str());
+                    throw std::runtime_error("download");
+                }
+                if (!verify_sha256(zip, pkg.hash)) {
+                    DeleteFileW(zip.c_str());
+                    logf(L"PP-OCR 组件 SHA-256 校验失败：文件=%s", pkg.name);
+                    throw std::runtime_error("checksum");
+                }
+                update(L"正在安装 " + std::wstring(pkg.name) + L"…",
+                       total ? (int)(done.load() * 92 / total) : 92);
+                if (!extract_package(zip, ppocr_component_dir(), pkg.runtime)) {
+                    logf(L"PP-OCR 组件解压失败：文件=%s 目标=%s", pkg.name,
+                         ppocr_component_dir().c_str());
+                    throw std::runtime_error("extract");
+                }
+                std::filesystem::remove(zip);
             }
-            if (cancel) throw std::runtime_error("cancel");
-            update(L"正在校验 OCR 组件…", 92);
-            if (!verify_sha256(zip, kPackageSha256)) {
-                DeleteFileW(zip.c_str());
-                logf(L"PP-OCR 组件 SHA-256 校验失败，已删除下载文件");
-                throw std::runtime_error("checksum");
-            }
-            update(L"正在安装 OCR 组件…", 96);
-            if (!extract_package(zip, ppocr_component_dir())) {
-                logf(L"PP-OCR 组件解压失败：目标=%s", ppocr_component_dir().c_str());
-                throw std::runtime_error("extract");
-            }
-            std::filesystem::remove(zip);
+            if (!dir_ready(ppocr_component_dir())) throw std::runtime_error("extract");
             update(L"OCR 组件下载完成。", 100);
             logf(L"PP-OCR 组件安装完成：%s", ppocr_component_dir().c_str());
         } catch (const std::exception&) {

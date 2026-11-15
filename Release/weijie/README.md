@@ -1,3 +1,13 @@
+# 微截 1.8.1
+
+OCR 收敛为 PP-OCRv6 三档：tiny / small / medium，移除混元 OCR 的选项与下载入口。
+
+- 设置页不再显示「识别引擎」，只保留「模型档位」与「推理设备」；旧配置中的混元 OCR 引擎自动归一到 PP-OCRv6。
+- OCR 运行时与三档模型拆成四个发布资产：`weijie-ocr-ncnn.zip`（运行时 26 MB）、`PP-OCRv6-tiny.zip`（5.4 MB）、`PP-OCRv6-small.zip`（11.7 MB）、`PP-OCRv6-medium.zip`（96 MB）。
+- 组件下载按“运行时 → tiny → small → medium”逐包断点续传、SHA-256 校验并解压；全部就绪后才标记为已安装。
+- 移除 OpenVINO / Python OCR 回退，识别固定走 ncnn Vulkan 侧车。
+- 其余功能与 1.8.0 相同。
+
 # 微截 1.8.0
 
 PP-OCRv6 的检测与识别预处理改为按档位自适应，同一套 ncnn 组件可运行 tiny / small / medium 三档模型。
@@ -52,7 +62,10 @@ PP-OCRv6 的检测与识别预处理改为按档位自适应，同一套 ncnn �
 | 资产 | 体积 | 用途 |
 |---|---:|---|
 | `weijie-llama-runtime.zip` | 36 MB | llama.cpp Vulkan 运行时，识别与翻译共用 |
-| `weijie-ocr-ncnn.zip` | 140 MB | PP-OCRv6 tiny / small / medium + ncnn Vulkan 组件 |
+| `weijie-ocr-ncnn.zip` | 26 MB | ncnn Vulkan 运行时（含 OpenCV） |
+| `PP-OCRv6-tiny.zip` | 5.4 MB | PP-OCRv6 tiny 检测与识别权重 |
+| `PP-OCRv6-small.zip` | 11.7 MB | PP-OCRv6 small 检测与识别权重 |
+| `PP-OCRv6-medium.zip` | 96 MB | PP-OCRv6 medium 检测与识别权重 |
 | `HunyuanOCR-Q8_0.gguf` + `mmproj-HunyuanOCR-Q8_0.gguf` | 1.25 GB | 混元 OCR 高精度 |
 | `HunyuanOCR-Q3_K_S.gguf` + mmproj | 972 MB | 混元 OCR 轻量 |
 | `Haidass-Translate-143M.Q8_0.gguf` | 147 MB | 中英双向翻译 |

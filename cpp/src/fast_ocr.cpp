@@ -90,31 +90,6 @@ std::wstring find_runtime_dir() {
             return dir;
         }
     }
-    const std::wstring candidates[] = {
-        root + L"\\ocr-fast",
-        localappdata_dir() + L"\\ocr-fast",
-    };
-    for (const auto& dir : candidates) {
-        if (!file_exists(dir + L"\\python.exe") ||
-            !file_exists(dir + L"\\ocr_sidecar.py") ||
-            !file_exists(dir + L"\\Lib\\site-packages\\rapidocr\\__init__.py")) {
-            continue;
-        }
-        bool models_ok = true;
-        for (const wchar_t* name : {
-                 L"PP-OCRv6_det_small.onnx",
-                 L"PP-OCRv6_rec_small.onnx",
-                 L"ch_ppocr_mobile_v2.0_cls_mobile.onnx"}) {
-            if (!file_exists(dir + L"\\models\\" + name)) {
-                models_ok = false;
-                break;
-            }
-        }
-        if (models_ok) {
-            g_use_ncnn.store(false);
-            return dir;
-        }
-    }
     return {};
 }
 
@@ -241,10 +216,7 @@ bool start_sidecar_locked(std::wstring& err) {
     si.hStdOutput = child_out_write;
     si.hStdError = nul != INVALID_HANDLE_VALUE ? nul : child_out_write;
     PROCESS_INFORMATION pi{};
-    std::wstring cmd = g_use_ncnn.load()
-        ? L"\"" + g_runtime_dir + L"\\ocr_ncnn.exe\""
-        : L"\"" + g_runtime_dir + L"\\python.exe\" \"" +
-          g_runtime_dir + L"\\ocr_sidecar.py\"";
+    std::wstring cmd = L"\"" + g_runtime_dir + L"\\ocr_ncnn.exe\"";
     std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
     cmdline.push_back(0);
 
@@ -366,15 +338,7 @@ std::wstring fast_ocr_status_text() {
     if (find_runtime_dir().empty()) {
         return L"OCR 组件未安装，请在设置的文字识别页下载 OCR 组件和 PP 模型";
     }
-    if (g_use_ncnn.load()) {
-        return L"PP-OCRv6 · ncnn Vulkan 就绪；Intel / AMD / NVIDIA；无 Vulkan 回退 CPU。";
-    }
-    std::wstring text = L"OpenVINO 已就绪；";
-    text += gpu_ocr_supported()
-        ? L"CPU / Intel 核显可用；"
-        : L"CPU 可用；检测到 AMD / NVIDIA 独显，GPU 自动关闭；";
-    text += L"首次编译可能较慢，连续识别复用进程。";
-    return text;
+    return L"PP-OCRv6 · ncnn Vulkan 就绪；Intel / AMD / NVIDIA；无 Vulkan 回退 CPU。";
 }
 
 bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& err,

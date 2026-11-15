@@ -194,8 +194,7 @@ Settings load_settings() {
     s.stroke_width = std::clamp(get_json_int(js, "stroke_width", 3), 1, 30);
     s.recent_colors=u8_to_w(get_json_str(js,"recent_colors"));
     if(!(v=get_json_str(js,"ocr_backend")).empty())s.ocr_backend=u8_to_w(v);
-    if(!(v=get_json_str(js,"ocr_engine")).empty())s.ocr_engine=u8_to_w(v);
-    if(s.ocr_engine.empty()||s.ocr_engine==L"fast")s.ocr_engine=L"ppocr";
+    s.ocr_engine=L"ppocr";
     if(!(v=get_json_str(js,"ocr_ppocr_profile")).empty())s.ocr_ppocr_profile=u8_to_w(v);
     if(s.ocr_ppocr_profile!=L"tiny"&&s.ocr_ppocr_profile!=L"medium")s.ocr_ppocr_profile=L"small";
     if(!(v=get_json_str(js,"ocr_benchmark")).empty())s.ocr_benchmark=u8_to_w(v);

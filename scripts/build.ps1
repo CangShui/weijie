@@ -27,7 +27,7 @@ $Tests = Join-Path $Release 'Tests'
 $Reports = Join-Path $Release 'verification'
 $RuntimeNames = @('images')
 $AppSources = @('main', 'autostart', 'overlay', 'annotate', 'capture', 'desktop_duplication', 'longshot', 'ocr',
-    'fast_ocr', 'style_popup', 'ocr_setup', 'ppocr_setup', 'translate', 'models', 'download',
+    'fast_ocr', 'style_popup', 'ppocr_setup', 'translate', 'models', 'download',
     'pin', 'output', 'settings', 'common', 'emoji_renderer', 'emoji_popup', 'animated_image') |
     ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
 $Resource = Join-Path $Root 'cpp\src\app.rc'
@@ -276,7 +276,7 @@ function Package-Application {
 function Invoke-CoreTest([string]$Argument, [string]$Label) {
     $temporary = Join-Path $App '_core_tests.exe'
     $sources = @('settings', 'common', 'autostart', 'output', 'longshot', 'pin', 'ocr', 'desktop_duplication',
-        'fast_ocr', 'style_popup', 'emoji_renderer', 'ocr_setup', 'models', 'download',
+        'fast_ocr', 'style_popup', 'emoji_renderer', 'models', 'download',
         'annotate', 'animated_image') |
         ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
     if (-not $script:CoreCompiled) {
@@ -319,7 +319,7 @@ function Invoke-OcrLifecycleTest {
     $exe = Join-Path $Tests 'ocr_lifecycle_tests.exe'
     Compile-Target 'ocr-fixture' @((Join-Path $Root 'cpp\tests\ocr_worker_fixture.cpp')) `
         $fixture $false $false
-    $sources = @('settings', 'common', 'ocr', 'fast_ocr', 'ocr_setup', 'models', 'download') |
+    $sources = @('settings', 'common', 'ocr', 'fast_ocr', 'models', 'download') |
         ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
     Compile-Target 'ocr-lifecycle' (@((Join-Path $Root 'cpp\tests\ocr_lifecycle_tests.cpp')) + $sources) `
         $exe $false $false

@@ -3,7 +3,6 @@
 #include "overlay.h"
 #include "pin.h"
 #include "output.h"
-#include "ocr_setup.h"
 #include "ppocr_setup.h"
 #include "longshot.h"
 #include "fast_ocr.h"
@@ -30,7 +29,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.8.0"
+#define APP_VERSION L"1.8.1"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101
@@ -429,7 +428,7 @@ struct CfgDlg {
  double scale=g_scale;
  HWND hwnd{}, tab{}, hotkey{}, monitor{}, saveDir{}, format{}, quality{}, qualityVal{};
  HWND autoCopy{}, includeCursor{}, autostart{}, stroke{}, fontSize{};
- HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{}, ocrIdle{}, ocrProfile{};
+ HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrBackend{}, ocrBench{}, ocrIdle{}, ocrProfile{};
  HWND translateEnabled{};
  HWND translateModel{}, translateImport{}, translateDownload{}, translateStatus{}, translateProgress{};
  std::vector<GgufFile> translateFiles;
@@ -465,39 +464,25 @@ static void choose_page(CfgDlg*d){
  for(int i=0;i<3;++i){if(i==d->page)SetPropW(d->nav[i],L"JjSelected",(HANDLE)1);else RemovePropW(d->nav[i],L"JjSelected");InvalidateRect(d->nav[i],nullptr,FALSE);}
  InvalidateRect(d->hwnd,nullptr,TRUE);
 }
-static int selected_ocr_engine(CfgDlg*d){
- return d&&d->ocrEngine?(int)SendMessageW(d->ocrEngine,CB_GETCURSEL,0,0):0;
-}
 static void refresh_download(CfgDlg*d){
- if(selected_ocr_engine(d)==2){
-  auto state=ppocr_download_state();
-  if(state.busy){
-   SetWindowTextW(d->ocrStatus,state.text.c_str());
-   SetWindowTextW(d->ocrDownload,L"取消下载");
-   EnableWindow(d->ocrDownload,TRUE);
-   SendMessageW(d->ocrProgress,PBM_SETPOS,state.percent,0);
-  }else if(ppocr_component_ready()){
-   SetWindowTextW(d->ocrStatus,ppocr_component_status_text().c_str());
-   SetWindowTextW(d->ocrDownload,L"组件已安装");
-   EnableWindow(d->ocrDownload,FALSE);
-   SendMessageW(d->ocrProgress,PBM_SETPOS,100,0);
-  }else{
-   SetWindowTextW(d->ocrStatus,state.text.empty()
-       ? ppocr_component_status_text().c_str() : state.text.c_str());
-   SetWindowTextW(d->ocrDownload,L"下载 OCR 组件和 PP 模型");
-   EnableWindow(d->ocrDownload,TRUE);
-   SendMessageW(d->ocrProgress,PBM_SETPOS,0,0);
-  }
-  return;
+ auto state=ppocr_download_state();
+ if(state.busy){
+  SetWindowTextW(d->ocrStatus,state.text.c_str());
+  SetWindowTextW(d->ocrDownload,L"取消下载");
+  EnableWindow(d->ocrDownload,TRUE);
+  SendMessageW(d->ocrProgress,PBM_SETPOS,state.percent,0);
+ }else if(ppocr_component_ready()){
+  SetWindowTextW(d->ocrStatus,ppocr_component_status_text().c_str());
+  SetWindowTextW(d->ocrDownload,L"组件已安装");
+  EnableWindow(d->ocrDownload,FALSE);
+  SendMessageW(d->ocrProgress,PBM_SETPOS,100,0);
+ }else{
+  SetWindowTextW(d->ocrStatus,state.text.empty()
+      ? ppocr_component_status_text().c_str() : state.text.c_str());
+  SetWindowTextW(d->ocrDownload,L"下载 OCR 组件和 PP 模型");
+  EnableWindow(d->ocrDownload,TRUE);
+  SendMessageW(d->ocrProgress,PBM_SETPOS,0,0);
  }
- EnableWindow(d->ocrDownload,TRUE);
- const bool fast=selected_ocr_engine(d)==1;
- auto state=hunyuan_download_state();
- std::wstring t=state.text.empty()
-     ?(fast?hunyuan_fast_model_status_text():hunyuan_model_status_text()):state.text;
- SetWindowTextW(d->ocrStatus,t.c_str());
- SetWindowTextW(d->ocrDownload,state.busy?L"取消下载":L"下载 / 校验模型");
- SendMessageW(d->ocrProgress,PBM_SETPOS,state.percent,0);
 }
 static std::wstring selected_translate_file(CfgDlg*d){
  if(!d||!d->translateModel)return g_cfg.translate_model;
@@ -601,24 +586,15 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    logf(L"识别主开关已即时关闭并卸载模型；保存后保留关闭状态，取消则恢复原开关但不预加载模型");
    return 0;
   }
-   if((id==109||id==112)&&HIWORD(wp)==CBN_SELCHANGE){refresh_download(d);refresh_translate(d);return 0;}
+   if(id==112&&HIWORD(wp)==CBN_SELCHANGE){refresh_download(d);refresh_translate(d);return 0;}
   if(id==10){
    BROWSEINFOW bi{};bi.hwndOwner=h;bi.lpszTitle=L"选择截图保存目录";bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
    auto pidl=SHBrowseForFolderW(&bi);if(pidl){wchar_t path[MAX_PATH]{};if(SHGetPathFromIDListW(pidl,path))SetWindowTextW(d->saveDir,path);CoTaskMemFree(pidl);}return 0;
   }
   if(id==11){
-   if(selected_ocr_engine(d)==2){
-    auto state=ppocr_download_state();
-    if(state.busy)ppocr_cancel_download();
-    else ppocr_download_async();
-    refresh_download(d);return 0;
-   }
-   const bool fast=selected_ocr_engine(d)==1;
-   if(hunyuan_download_state().busy)hunyuan_cancel_download();
-   else{
-    std::wstring message=L"将从 GitHub 模型发布页下载"+std::wstring(fast?L"混元轻量 Q3":L"混元高精度 Q8")+L"权重与共用运行时（约 "+human_size(hunyuan_download_size(fast))+L"）。\n已完整下载且校验通过的文件会跳过；下载支持断点续传和多线程。\n混元模型遵循腾讯混元社区许可。\n是否继续？";
-    if(MessageBoxW(h,message.c_str(),L"混元 OCR",MB_YESNO|MB_ICONINFORMATION)==IDYES)hunyuan_download_models_async(fast);
-   }
+   auto state=ppocr_download_state();
+   if(state.busy)ppocr_cancel_download();
+   else ppocr_download_async();
    refresh_download(d);return 0;
   }
   if(id==12){
@@ -666,8 +642,8 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
   }
   if(id!=1)return 0;
   LogTrace trace;
-  logf(L"保存设置请求到达：页面=%d OCR启用=%d 所选引擎=%d",
-       d->page, (int)checked(d->ocrEnabled), selected_ocr_engine(d));
+  logf(L"保存设置请求到达：页面=%d OCR启用=%d 引擎=PP-OCRv6",
+       d->page, (int)checked(d->ocrEnabled));
   Settings next=g_cfg;next.hotkey_enabled=checked(d->monitor);
   auto hk=hotkey_name(d->hotkey);UINT mods=0,vk=0;
   if(next.hotkey_enabled&&!resolve_hotkey(hk,mods,vk)){logf(L"保存设置被拒绝：全局快捷键格式无效，未写入设置");MessageBoxW(h,L"请录入 Ctrl / Alt 组合键，或 F1–F24 / PrintScreen。",L"快捷键无效",MB_OK|MB_ICONWARNING);return 0;}
@@ -685,8 +661,7 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    next.auto_copy=checked(d->autoCopy);next.include_cursor=checked(d->includeCursor);next.ocr_enabled=checked(d->ocrEnabled);
    next.translate_enabled=checked(d->translateEnabled);
    next.translate_model=selected_translate_file(d);
-   int engineIndex=(int)SendMessageW(d->ocrEngine,CB_GETCURSEL,0,0);
-   next.ocr_engine=engineIndex==2?L"ppocr":engineIndex==1?L"hunyuan_fast":L"hunyuan";
+   next.ocr_engine=L"ppocr";
    int profileIndex=(int)SendMessageW(d->ocrProfile,CB_GETCURSEL,0,0);
    next.ocr_ppocr_profile=profileIndex==0?L"tiny":profileIndex==2?L"medium":L"small";
    int backendIndex=(int)SendMessageW(d->ocrBackend,CB_GETCURSEL,0,0);
@@ -1021,7 +996,6 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     g_watchStop.store(true);
     if (g_watch.joinable()) g_watch.join();
     ppocr_download_shutdown();
-    hunyuan_download_shutdown();
     ocr_set_enabled(false);
     fast_ocr_shutdown();
     if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }

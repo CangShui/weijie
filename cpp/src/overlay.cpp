@@ -1,6 +1,5 @@
 #include "overlay.h"
 #include "ocr.h"
-#include "ocr_setup.h"
 #include "longshot.h"
 #include "style_popup.h"
 #include "emoji_popup.h"
