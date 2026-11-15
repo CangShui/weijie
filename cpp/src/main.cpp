@@ -29,7 +29,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.8.1"
+#define APP_VERSION L"1.8.2"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101

@@ -7,9 +7,8 @@
 #include <filesystem>
 #include <fstream>
 
-// PP-OCRv6 sidecars. ocr-ncnn is the Vulkan-capable C++ engine; ocr-fast
-// remains a legacy OpenVINO fallback. The worker stays alive between captures
-// so model loading/pipeline compilation is paid only once.
+// PP-OCRv6 sidecar. ocr-ncnn is the Vulkan-capable C++ engine. The worker stays
+// alive between captures so model loading/pipeline compilation is paid once.
 namespace {
 
 std::mutex g_lock;

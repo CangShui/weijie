@@ -9,6 +9,7 @@ Release/weijie/manifest.json
 Release/weijie/*.zip
 Release/weijie/ocr-ncnn/
 runtime/ocr-ncnn/
+runtime/*.zip
 *.obj
 *.res
 *.pdb

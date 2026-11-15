@@ -23,8 +23,8 @@ struct Package {
 
 // 运行时与三档模型分开发布，安装时逐包下载、校验、解压。
 const Package kPackages[] = {
-    {L"weijie-ocr-ncnn.zip", 27243945ull,
-     L"93472f2934ed57e9a0c62e88b5b8a478e67e5c9e5c706c2bab2e88df17566a36", true},
+    {L"weijie-ocr-ncnn.zip", 28788628ull,
+     L"b7aba03e84dec7b01714fb891cd2826a318971ede5426ad507c7b4d60d154996", true},
     {L"PP-OCRv6-tiny.zip", 5693359ull,
      L"5261fbc5d5e0bf806da445def1adbc85dbee86896bff68b50da4ada84cd9a3ad", false},
     {L"PP-OCRv6-small.zip", 12249612ull,
@@ -104,7 +104,7 @@ bool ppocr_component_ready() {
 
 std::wstring ppocr_component_status_text() {
     if (ppocr_component_ready()) return L"PP-OCRv6 已安装：tiny / small / medium 三档可选。";
-    return L"OCR 组件未安装。点击下方按钮下载运行时与 PP-OCRv6 三档模型（约 146 MB）。";
+    return L"OCR 组件未安装。点击下方按钮下载运行时与 PP-OCRv6 三档模型（约 147 MB）。";
 }
 
 PpOcrDownloadState ppocr_download_state() {

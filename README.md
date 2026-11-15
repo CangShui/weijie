@@ -2,7 +2,7 @@
 
 原生 C++20 / Win32 / GDI+ 截图工具。基础产物不包含模型与运行时；
 权重统一放在程序目录 `models\weights`，运行时放在 `models\runtime`，
-文字识别与本地翻译共用同一套 llama.cpp / ncnn 运行时，全部从
+文字识别使用 ncnn 运行时，本地翻译使用 llama.cpp 运行时，全部从
 <https://github.com/CangShui/weijie/releases/tag/models> 按需下载。
 识别和翻译都在本机完成，不联网发送截图或文字。
 
@@ -86,7 +86,7 @@ Index-Translate 2B 约 1.25 GB / 1.98 GB）。选中的模型缺失时，按钮�
 支持断点续传、多线程和 SHA-256 校验；已完整下载的文件只校验，不重复下载。
 
 「导入模型」把选中的 `.gguf` 复制到 `models\weights`，源文件保持不动，同名文件先询问覆盖。
-翻译与识别共用 `models\runtime\llama`，任一侧下载后另一侧无需重复下载。
+翻译使用 `models\runtime\llama`，识别使用 `models\runtime\ppocr-ncnn`，两者独立下载、互不重复。
 翻译调用 `llama-cli` 单轮对话，按模型自身模板构造提示，超过 900 字的文本分段串行处理。
 
 ### 截图唤起速度

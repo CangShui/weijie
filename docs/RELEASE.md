@@ -1,3 +1,12 @@
+# 微截 1.8.2
+
+修复 OCR 组件在全新安装时的完整性判定。
+
+- `weijie-ocr-ncnn.zip` 补入方向分类模型 `PP_LCNet_x0_25_textline_ori`，此前该文件只在开发机运行时目录中存在，按发布包安装会下载完却判定失败。
+- 运行时包更新为 28.8 MB，SHA-256 `b7aba03e84dec7b01714fb891cd2826a318971ede5426ad507c7b4d60d154996`；tiny / small / medium 三个模型包不变。
+- 新装流程按“运行时 → tiny → small → medium”解压后即可通过完整性检查，三档模型均可在 AMD Vulkan 下直接识别。
+- 其余功能与 1.8.1 相同。
+
 # 微截 1.8.1
 
 OCR 收敛为 PP-OCRv6 三档：tiny / small / medium，移除混元 OCR 的选项与下载入口。

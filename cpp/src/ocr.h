@@ -1,7 +1,7 @@
 #pragma once
 #include "common.h"
 
-// Local HunyuanOCR via the bundled llama.cpp runtime.
+// Local PP-OCRv6 recognition via the bundled ncnn sidecar.
 bool ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& err, const std::atomic<bool>* cancel = nullptr);
 
 // 主开关关闭时终止本程序持有的模型进程；重新开启只恢复按需加载。
