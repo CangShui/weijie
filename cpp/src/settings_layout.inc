@@ -23,7 +23,7 @@ static void cfg_paint(CfgDlg*d,HDC dc){
     Pen icon(Color::White,SF(1.5));g.DrawRectangle(&icon,SF(32),SF(35),SF(14),SF(12));
     ui::text(g,L"微截",r(66,23,112,32),20,ui::ink(),true);
     ui::text(g,L"让截图更简单",r(24,64,156,22),12,ui::muted());
-    ui::text(g,L"1.7  ·  原生桌面版",r(24,524,156,25),11,ui::muted());
+    ui::text(g,L"1.8  ·  原生桌面版",r(24,524,156,25),11,ui::muted());
     const wchar_t* names[]={L"截图与快捷键",L"文字识别",L"翻译服务"};
     const wchar_t* desc[]={L"按你的习惯，设置每一次截图",L"本地识别，按需启用",L"本地模型翻译，不联网"};
     ui::text(g,names[d->page],r(228,21,560,34),21,ui::ink(),true);
@@ -34,6 +34,7 @@ static void cfg_paint(CfgDlg*d,HDC dc){
         ui::separator(g,226,352,568);
     }else if(d->page==1){
         ui::separator(g,226,216,568);
+        ui::separator(g,226,390,568);
     }else{
         ui::box(g,r(226,404,568,64),ui::tint(),8);
         ui::text(g,L"翻译在本机完成，截图和文字不会离开这台电脑。\n运行时与 OCR 共用 models\\runtime。",
@@ -104,7 +105,7 @@ static void cfg_layout(CfgDlg*d){
     }
     label(d,1,L"识别引擎",226,239,132);
     d->ocrEngine=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,231,418,200,109);
-    for(auto t:{L"混元 OCR · 高精度 Q8（551 MB）",L"混元 OCR · 轻量 Q3（272 MB）",L"PP-OCRv6 · ncnn Vulkan（42 MB）"})SendMessageW(d->ocrEngine,CB_ADDSTRING,0,(LPARAM)t);
+    for(auto t:{L"混元 OCR · 高精度 Q8（551 MB）",L"混元 OCR · 轻量 Q3（272 MB）",L"PP-OCRv6 · ncnn Vulkan（tiny / small / medium）"})SendMessageW(d->ocrEngine,CB_ADDSTRING,0,(LPARAM)t);
     SendMessageW(d->ocrEngine,CB_SETCURSEL,g_cfg.ocr_engine==L"ppocr"?2:g_cfg.ocr_engine==L"hunyuan_fast"?1:0,0);
     label(d,1,L"推理设备",226,287,132);
     d->ocrBackend=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,279,418,200,110);
@@ -117,16 +118,21 @@ static void cfg_layout(CfgDlg*d){
     }
     SendMessageW(d->ocrBackend,CB_SETCURSEL,
                  g_cfg.ocr_backend==L"gpu"?(gpuAvailable?2:1):g_cfg.ocr_backend==L"cpu"?1:0,0);
-    setting_hint(d,1,L"空闲超时释放模型；不打断识别，下次调用按需加载。",226,330,566,22);
-    setting_hint(d,1,L"GPU 使用 Vulkan：支持 Intel / AMD / NVIDIA；无 Vulkan 驱动时自动回退 CPU。",226,352,566,22);
-    d->ocrBench=control(d,1,L"STATIC",L"运行时与权重安装在程序目录 models 下，来源为 GitHub 模型发布页。",0,226,378,566,24);
-    d->ocrStatus=control(d,1,L"STATIC",L"",0,226,404,566,40,105);
-    d->ocrProgress=control(d,1,PROGRESS_CLASSW,L"",PBS_SMOOTH,226,450,566,6);
+    label(d,1,L"模型档位",226,335,132);
+    d->ocrProfile=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,327,418,200,114);
+    for(auto t:{L"tiny · 轻量（6 MB）",L"small · 默认（15 MB）",L"medium · 高精度（138 MB）"})
+        SendMessageW(d->ocrProfile,CB_ADDSTRING,0,(LPARAM)t);
+    SendMessageW(d->ocrProfile,CB_SETCURSEL,
+                 g_cfg.ocr_ppocr_profile==L"tiny"?0:g_cfg.ocr_ppocr_profile==L"medium"?2:1,0);
+    setting_hint(d,1,L"空闲超时释放模型；GPU 走 Vulkan，无驱动时自动回退 CPU。",226,366,566,22);
+    d->ocrBench=control(d,1,L"STATIC",L"运行时与权重安装在程序目录 models 下，来源为 GitHub 模型发布页。",0,226,392,566,24);
+    d->ocrStatus=control(d,1,L"STATIC",L"",0,226,418,566,40,105);
+    d->ocrProgress=control(d,1,PROGRESS_CLASSW,L"",PBS_SMOOTH,226,470,566,6);
     SendMessageW(d->ocrProgress,PBM_SETRANGE32,0,100);
     SendMessageW(d->ocrProgress,PBM_SETBARCOLOR,0,RGB(7,193,96));SendMessageW(d->ocrProgress,PBM_SETBKCOLOR,0,RGB(232,239,234));
-    d->ocrDownload=control(d,1,L"BUTTON",L"下载 / 校验模型",WS_TABSTOP,226,474,186,36,11);
-    label(d,1,L"本地推理 · 保护隐私",484,480,308,24);
-    setting_hint(d,1,L"下载前请阅读随程序提供的模型许可。",226,520,566,24);
+    d->ocrDownload=control(d,1,L"BUTTON",L"下载 / 校验模型",WS_TABSTOP,226,492,186,36,11);
+    label(d,1,L"本地推理 · 保护隐私",484,498,308,24);
+    setting_hint(d,1,L"下载前请阅读随程序提供的模型许可。",226,534,566,22);
 
     d->translateEnabled=setting_check(d,2,L"显示翻译按钮",226,115,550,17,g_cfg.translate_enabled);
     setting_hint(d,2,L"翻译完全在本机运行，不发送截图或文字；识别关闭时仍可翻译已有结果。",226,154,566,25);

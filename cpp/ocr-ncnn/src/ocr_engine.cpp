@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utility>
 #include <fstream>
 #include <stdexcept>
@@ -11,6 +12,26 @@
 
 namespace
 {
+
+// Same lookup without the warning: used for optional per-profile overrides.
+template <typename T>
+T GetOptional(const nlohmann::json &json, const std::vector<std::string> &keys, const T &dft)
+{
+    try
+    {
+        const nlohmann::json *current = &json;
+        for (const auto &key : keys)
+        {
+            if (!current->is_object() || !current->contains(key)) return dft;
+            current = &((*current)[key]);
+        }
+        return current->get<T>();
+    }
+    catch (const std::exception &)
+    {
+        return dft;
+    }
+}
 
 template <typename T>
 T GetJValue(const nlohmann::json &json, const std::vector<std::string> &keys, const T &dft)
@@ -44,9 +65,9 @@ T GetJValue(const nlohmann::json &json, const std::vector<std::string> &keys, co
 namespace OCR
 {
 
-OCREngine::OCREngine(const std::string &config_path)
+OCREngine::OCREngine(const std::string &config_path, const std::string &profile)
 {
-    Initialize(config_path);
+    Initialize(config_path, profile);
 }
 
 OCREngine::OCREngine(OCREngine &&other) noexcept
@@ -70,7 +91,7 @@ OCREngine & OCREngine::operator = (OCREngine &&other) noexcept
     return *this;
 }
 
-bool OCREngine::Initialize(const std::string &config_path)
+bool OCREngine::Initialize(const std::string &config_path, const std::string &profile)
 {
     // load json
     nlohmann::json j{};
@@ -113,8 +134,36 @@ bool OCREngine::Initialize(const std::string &config_path)
     rec_config.reco_threads = GetThreads(GetJValue(j, {"rec", "reco_threads"}, 1));
     rec_config.model_path = GetJValue(j, {"rec", "model_path"}, std::string());
     rec_config.keys_path = GetJValue(j, {"rec", "keys_path"}, std::string());
+    rec_config.target_h = std::max(GetJValue(j, {"rec", "target_h"}, 48), 8);
     rec_config.is_fp16 = GetJValue(j, {"rec", "fp16"}, false);
     rec_config.use_vulkan = GetJValue(j, {"rec", "use_vulkan"}, false);
+
+    // Optional model profiles (tiny / small / medium) share one config file and
+    // override only what differs between the PP-OCRv6 releases.
+    if (!profile.empty())
+    {
+        if (j.contains("profiles") && j["profiles"].is_object() && j["profiles"].contains(profile))
+        {
+            const nlohmann::json &p = j["profiles"][profile];
+            det_config.model_path = GetOptional(p, {"det", "model_path"}, det_config.model_path);
+            det_config.max_side_len = GetOptional(p, {"det", "max_side_len"}, det_config.max_side_len);
+            det_config.padding = GetOptional(p, {"det", "padding"}, det_config.padding);
+            det_config.box_thres = GetOptional(p, {"det", "box_thres"}, det_config.box_thres);
+            det_config.bitmap_thres = GetOptional(p, {"det", "bitmap_thres"}, det_config.bitmap_thres);
+            det_config.unclip_ratio = GetOptional(p, {"det", "unclip_ratio"}, det_config.unclip_ratio);
+            rec_config.model_path = GetOptional(p, {"rec", "model_path"}, rec_config.model_path);
+            rec_config.keys_path = GetOptional(p, {"rec", "keys_path"}, rec_config.keys_path);
+            rec_config.target_h = GetOptional(p, {"rec", "target_h"}, rec_config.target_h);
+            PLOGI << "OCR model profile: " << profile
+                  << " det=" << det_config.model_path
+                  << " rec=" << rec_config.model_path;
+        }
+        else
+        {
+            PLOGE << "Unknown OCR model profile: " << profile;
+            return false;
+        }
+    }
 
     // show configs
     ShowConfig();
@@ -225,8 +274,8 @@ void OCREngine::ShowConfig() const
         cls_config.infer_threads, cls_config.reco_threads, cls_config.enable, cls_config.most_angle, cls_config.is_fp16);
 
     PLOGD << "Rec config";
-    PLOGD.printf("  infer_threads(%d) reco_threads(%d) fp16(%d)",
-        rec_config.infer_threads, rec_config.reco_threads, rec_config.is_fp16);
+    PLOGD.printf("  infer_threads(%d) reco_threads(%d) target_h(%d) fp16(%d)",
+        rec_config.infer_threads, rec_config.reco_threads, rec_config.target_h, rec_config.is_fp16);
 
     PLOGD << "---------------------------------------";
 }

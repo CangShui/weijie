@@ -47,17 +47,28 @@ bool CRNNNet::Initialize(const RecConfig &config)
     net_->opt.use_fp16_arithmetic = config_.is_fp16;
     net_->opt.use_vulkan_compute = config_.use_vulkan;
 
-    // load keys
-    std::string line;
+    // PaddleOCR lists characters in class order: class 0 is the CTC blank and
+    // the last class is a space. The small dictionary spells both out, the tiny
+    // and medium ones do not, so normalize every dictionary to that layout.
     std::ifstream ifs{config_.keys_path};
     if (!ifs.is_open())
     {
         PLOGE << "Failed to load keys " << config_.keys_path;
         return false;
     }
-    keys_.clear();
+    std::vector<std::string> chars;
+    std::string line;
     while (std::getline(ifs, line))
-        keys_.emplace_back(line);
+    {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        chars.emplace_back(line);
+    }
+    if (!chars.empty() && chars.front().empty()) chars.erase(chars.begin());
+    if (chars.empty() || chars.back() != " ") chars.emplace_back(" ");
+    keys_.clear();
+    keys_.reserve(chars.size() + 1);
+    keys_.emplace_back();
+    keys_.insert(keys_.end(), chars.begin(), chars.end());
     PLOGD << "Total keys: " << keys_.size();
 
     if (net_->load_param((config_.model_path + ".param").c_str()) ||
@@ -67,6 +78,12 @@ bool CRNNNet::Initialize(const RecConfig &config)
         net_.reset();
         return false;
     }
+
+    if (!net_->input_names().empty() && net_->input_names()[0])
+        input_name_ = net_->input_names()[0];
+    if (!net_->output_names().empty() && net_->output_names()[0])
+        output_name_ = net_->output_names()[0];
+    PLOGD << "Rec io: " << input_name_ << " -> " << output_name_;
 
     return true;
 }
@@ -88,18 +105,24 @@ std::vector<TextLine> CRNNNet::Rec(const std::vector<cv::Mat> &text_images) cons
 TextLine CRNNNet::Rec(const cv::Mat &text_image) const
 {
     // resize
-    float ratio = static_cast<float>(target_h_) / text_image.rows;
-    int rsz_w = static_cast<int>(text_image.cols * ratio);
+    const int target_h = config_.target_h;
+    float ratio = static_cast<float>(target_h) / text_image.rows;
+    int rsz_w = std::max(static_cast<int>(text_image.cols * ratio), 1);
 
     ncnn::Mat blob = ncnn::Mat::from_pixels_resize(text_image.data, ncnn::Mat::PIXEL_BGR,
-        text_image.cols, text_image.rows, rsz_w, target_h_);
+        text_image.cols, text_image.rows, rsz_w, target_h);
     blob.substract_mean_normalize(mean_values_, norm_values_);
 
     // inference
     ncnn::Extractor ex = net_->create_extractor();
-    ex.input("input", blob);
+    ex.input(input_name_.c_str(), blob);
     ncnn::Mat out;
-    ex.extract("output", out);
+    ex.extract(output_name_.c_str(), out);
+    if (out.empty())
+    {
+        PLOGE << "Recognition returned no output, check " << config_.model_path;
+        return TextLine{};
+    }
 
     // decode output and get TextLine
     float *arr = reinterpret_cast<float *>(out.data);
@@ -112,7 +135,8 @@ TextLine CRNNNet::Score2TextLine(const std::vector<float> &scores, const int row
 {
     if (cols != static_cast<int>(keys_.size()))
     {
-        PLOGE << "Unmatched scores: " << cols << " != " << keys_.size();
+        PLOGE << "Unmatched scores: " << cols << " != " << keys_.size()
+              << " (" << config_.model_path << " / " << config_.keys_path << ")";
         return TextLine{};
     }
 

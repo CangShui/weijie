@@ -30,7 +30,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.7.3"
+#define APP_VERSION L"1.8.0"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101
@@ -429,7 +429,7 @@ struct CfgDlg {
  double scale=g_scale;
  HWND hwnd{}, tab{}, hotkey{}, monitor{}, saveDir{}, format{}, quality{}, qualityVal{};
  HWND autoCopy{}, includeCursor{}, autostart{}, stroke{}, fontSize{};
- HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{}, ocrIdle{};
+ HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{}, ocrIdle{}, ocrProfile{};
  HWND translateEnabled{};
  HWND translateModel{}, translateImport{}, translateDownload{}, translateStatus{}, translateProgress{};
  std::vector<GgufFile> translateFiles;
@@ -687,6 +687,8 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    next.translate_model=selected_translate_file(d);
    int engineIndex=(int)SendMessageW(d->ocrEngine,CB_GETCURSEL,0,0);
    next.ocr_engine=engineIndex==2?L"ppocr":engineIndex==1?L"hunyuan_fast":L"hunyuan";
+   int profileIndex=(int)SendMessageW(d->ocrProfile,CB_GETCURSEL,0,0);
+   next.ocr_ppocr_profile=profileIndex==0?L"tiny":profileIndex==2?L"medium":L"small";
    int backendIndex=(int)SendMessageW(d->ocrBackend,CB_GETCURSEL,0,0);
    LRESULT backend=SendMessageW(d->ocrBackend,CB_GETITEMDATA,backendIndex,0);
    next.ocr_backend=backend==1?L"cpu":backend==2?L"gpu":L"auto";

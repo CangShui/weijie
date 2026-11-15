@@ -36,6 +36,7 @@ struct RecConfig
     int reco_threads{1};
     std::string model_path;
     std::string keys_path;
+    int target_h{48};
     bool is_fp16{false};
     bool use_vulkan{false};
 };

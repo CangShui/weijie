@@ -6,6 +6,7 @@
 #include <io.h>
 
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -28,9 +29,9 @@ void respond(const char* status, const std::string& payload) {
     std::cout.flush();
 }
 
-std::unique_ptr<OCR::OCREngine> make_engine(const char* config) {
+std::unique_ptr<OCR::OCREngine> make_engine(const char* config, const std::string& profile) {
     auto engine = std::make_unique<OCR::OCREngine>();
-    if (!engine->Initialize(config)) return {};
+    if (!engine->Initialize(config, profile)) return {};
     return engine;
 }
 
@@ -42,9 +43,12 @@ int main() {
 
     std::cout << "READY\n" << std::flush;
 
-    std::unique_ptr<OCR::OCREngine> gpu_engine;
-    std::unique_ptr<OCR::OCREngine> cpu_engine;
-    bool gpu_tried = false;
+    // One engine per (device, model profile) pair. Profiles select the tiny /
+    // small / medium PP-OCRv6 weights declared in config-*.json.
+    std::map<std::string, std::unique_ptr<OCR::OCREngine>> engines;
+    std::map<std::string, bool> failed;
+    bool gpu_probed = false;
+    bool gpu_available = false;
 
     std::string device_line;
     while (std::getline(std::cin, device_line)) {
@@ -59,22 +63,41 @@ int main() {
             continue;
         }
 
-        bool want_gpu = device_line == "GPU" || device_line == "gpu";
-        if (want_gpu && !gpu_tried) {
-            gpu_tried = true;
-            if (ncnn::get_gpu_count() > 0) {
-                gpu_engine = make_engine("config-gpu.json");
-            }
+        std::string device = device_line;
+        std::string profile;
+        const size_t space = device_line.find_first_of(" \t");
+        if (space != std::string::npos) {
+            profile = trim_copy(device_line.substr(space + 1));
+            device = device_line.substr(0, space);
         }
+        bool want_gpu = device == "GPU" || device == "gpu";
+        if (want_gpu && !gpu_probed) {
+            gpu_probed = true;
+            gpu_available = ncnn::get_gpu_count() > 0;
+        }
+        if (want_gpu && !gpu_available) want_gpu = false;
 
-        OCR::OCREngine* engine = nullptr;
-        if (want_gpu) engine = gpu_engine.get();
+        auto obtain = [&](bool gpu) -> OCR::OCREngine* {
+            const std::string key = std::string(gpu ? "gpu:" : "cpu:") + profile;
+            auto it = engines.find(key);
+            if (it != engines.end()) return it->second.get();
+            if (failed[key]) return nullptr;
+            auto created = make_engine(gpu ? "config-gpu.json" : "config-cpu.json", profile);
+            if (!created) {
+                failed[key] = true;
+                return nullptr;
+            }
+            OCR::OCREngine* raw = created.get();
+            engines[key] = std::move(created);
+            return raw;
+        };
+
+        OCR::OCREngine* engine = obtain(want_gpu);
+        if (!engine && want_gpu) engine = obtain(false);
         if (!engine) {
-            if (!cpu_engine) cpu_engine = make_engine("config-cpu.json");
-            engine = cpu_engine.get();
-        }
-        if (!engine) {
-            respond("ERR", "failed to initialize PP-OCRv6 ncnn engine");
+            respond("ERR", profile.empty()
+                ? "failed to initialize PP-OCRv6 ncnn engine"
+                : "failed to initialize PP-OCRv6 ncnn engine for profile " + profile);
             continue;
         }
 

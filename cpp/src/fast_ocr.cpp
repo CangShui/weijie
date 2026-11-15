@@ -18,6 +18,7 @@ HANDLE g_process = nullptr;
 HANDLE g_in = nullptr;   // parent -> child stdin
 HANDLE g_out = nullptr;  // child stdout -> parent
 std::wstring g_runtime_dir;
+std::atomic<bool> g_profiles{false};
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_use_ncnn{false};
 bool g_sidecar_reused = false;
@@ -25,6 +26,22 @@ bool g_sidecar_reused = false;
 bool file_exists(const std::wstring& path) {
     DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// PP-OCRv6 ships in three sizes. The sidecar picks the matching weights from
+// its config, so the profile only has to name the tier.
+bool profile_ready(const std::wstring& dir, const std::wstring& profile) {
+    if (profile == L"tiny") {
+        return file_exists(dir + L"\\models\\PP-OCRv6_tiny_det.param") &&
+               file_exists(dir + L"\\models\\PP-OCRv6_tiny_rec.param") &&
+               file_exists(dir + L"\\models\\PP-OCRv6_vocab_tiny.txt");
+    }
+    if (profile == L"medium") {
+        return file_exists(dir + L"\\models\\PP-OCRv6_medium_det.param") &&
+               file_exists(dir + L"\\models\\PP-OCRv6_medium_rec.param") &&
+               file_exists(dir + L"\\models\\PP-OCRv6_vocab.txt");
+    }
+    return true;
 }
 
 void write_diag(const char* event, bool reused = false) {
@@ -50,7 +67,6 @@ std::wstring find_runtime_dir() {
     };
     for (const auto& dir : ncnn_candidates) {
         if (!file_exists(dir + L"\\ocr_ncnn.exe") ||
-            !file_exists(dir + L"\\ncnn.dll") ||
             !file_exists(dir + L"\\opencv_world4110.dll") ||
             !file_exists(dir + L"\\config-gpu.json") ||
             !file_exists(dir + L"\\config-cpu.json")) {
@@ -69,6 +85,8 @@ std::wstring find_runtime_dir() {
         }
         if (models_ok) {
             g_use_ncnn.store(true);
+            g_profiles.store(file_exists(dir + L"\\models\\PP-OCRv6_tiny_det.param") &&
+                             file_exists(dir + L"\\models\\PP-OCRv6_medium_det.param"));
             return dir;
         }
     }
@@ -391,10 +409,24 @@ bool fast_ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& 
     }
 
     Settings s = load_settings();
+    std::wstring profile = s.ocr_ppocr_profile;
+    if (profile != L"tiny" && profile != L"medium") profile = L"small";
     std::string device = (s.ocr_backend == L"gpu" && (g_use_ncnn.load() || gpu_ocr_supported())) ? "GPU" :
                          s.ocr_backend == L"cpu" ? "CPU" : "auto";
-    logf(L"PP-OCR request pid=%lu device=%s image=%ux%u",
-         GetProcessId(g_process), u8_to_w(device).c_str(), bmp->GetWidth(), bmp->GetHeight());
+    const bool ncnn = g_use_ncnn.load();
+    if (ncnn && !g_profiles.load()) profile = L"small";
+    if (ncnn && g_profiles.load()) {
+        if (!profile_ready(g_runtime_dir, profile)) {
+            DeleteFileW(image.c_str());
+            err = L"PP-OCRv6 " + profile + L" 档权重未安装，请在设置中下载或换用其它档位";
+            logf(L"PP-OCR 请求被拒绝：档位=%s 权重缺失 dir=%s", profile.c_str(), g_runtime_dir.c_str());
+            return false;
+        }
+        device += " " + w_to_u8(profile);
+    }
+    logf(L"PP-OCR request pid=%lu device=%s profile=%s image=%ux%u",
+         GetProcessId(g_process), u8_to_w(device).c_str(), profile.c_str(),
+         bmp->GetWidth(), bmp->GetHeight());
     std::string request = device + "\n" + w_to_u8(image) + "\n";
     if (!write_all(g_in, request.data(), request.size())) {
         DeleteFileW(image.c_str());

@@ -51,6 +51,12 @@ bool DBNet::Initialize(const DetConfig &config)
         return false;
     }
 
+    if (!net_->input_names().empty() && net_->input_names()[0])
+        input_name_ = net_->input_names()[0];
+    if (!net_->output_names().empty() && net_->output_names()[0])
+        output_name_ = net_->output_names()[0];
+    PLOGD << "Det io: " << input_name_ << " -> " << output_name_;
+
     return true;
 }
 
@@ -82,9 +88,14 @@ std::vector<TextBox> DBNet::Det(const cv::Mat &image) const
 
     // inference
     ncnn::Extractor ex = net_->create_extractor();
-    ex.input("input", blob);
+    ex.input(input_name_.c_str(), blob);
     ncnn::Mat out;
-    ex.extract("output", out);
+    ex.extract(output_name_.c_str(), out);
+    if (out.empty())
+    {
+        PLOGE << "Detection returned no output, check " << config_.model_path;
+        return {};
+    }
 
     // binarization
     const float denorm_values[1] = {255.0f};

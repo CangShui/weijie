@@ -196,6 +196,8 @@ Settings load_settings() {
     if(!(v=get_json_str(js,"ocr_backend")).empty())s.ocr_backend=u8_to_w(v);
     if(!(v=get_json_str(js,"ocr_engine")).empty())s.ocr_engine=u8_to_w(v);
     if(s.ocr_engine.empty()||s.ocr_engine==L"fast")s.ocr_engine=L"ppocr";
+    if(!(v=get_json_str(js,"ocr_ppocr_profile")).empty())s.ocr_ppocr_profile=u8_to_w(v);
+    if(s.ocr_ppocr_profile!=L"tiny"&&s.ocr_ppocr_profile!=L"medium")s.ocr_ppocr_profile=L"small";
     if(!(v=get_json_str(js,"ocr_benchmark")).empty())s.ocr_benchmark=u8_to_w(v);
     s.text_size = std::clamp(get_json_int(js, "text_size", 18), 10, 72);
     s.ocr_enabled = get_json_bool(js, "ocr_enabled", s.ocr_enabled);
@@ -230,6 +232,7 @@ bool save_settings(const Settings& s) {
     js += "  \"recent_colors\": \"" + json_escape(w_to_u8(s.recent_colors)) + "\",\n";
     js += "  \"ocr_backend\": \"" + json_escape(w_to_u8(s.ocr_backend)) + "\",\n";
     js += "  \"ocr_engine\": \"" + json_escape(w_to_u8(s.ocr_engine)) + "\",\n";
+    js += "  \"ocr_ppocr_profile\": \"" + json_escape(w_to_u8(s.ocr_ppocr_profile)) + "\",\n";
     js += "  \"ocr_benchmark\": \"" + json_escape(w_to_u8(s.ocr_benchmark)) + "\",\n";
     js += "  \"hotkey\": \"" + json_escape(w_to_u8(s.hotkey)) + "\",\n";
     js += "  \"hotkey_enabled\": " + std::string(s.hotkey_enabled ? "true" : "false") + ",\n";

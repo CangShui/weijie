@@ -35,6 +35,8 @@ public:
 private:
     DetConfig config_{};
     std::unique_ptr<ncnn::Net> net_{};
+    std::string input_name_{"input"};
+    std::string output_name_{"output"};
 
     static inline const int target_stride_{32};
     static inline const size_t max_candidates_{1000};

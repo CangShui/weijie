@@ -50,6 +50,11 @@ bool AngleNet::Initialize(const ClsConfig &config)
         return false;
     }
 
+    if (!net_->input_names().empty() && net_->input_names()[0])
+        input_name_ = net_->input_names()[0];
+    if (!net_->output_names().empty() && net_->output_names()[0])
+        output_name_ = net_->output_names()[0];
+
     return true;
 }
 
@@ -101,9 +106,10 @@ Angle AngleNet::Cls(const cv::Mat &image) const
 
     // inference
     ncnn::Extractor ex = net_->create_extractor();
-    ex.input("input", blob);
+    ex.input(input_name_.c_str(), blob);
     ncnn::Mat out;
-    ex.extract("output", out);
+    ex.extract(output_name_.c_str(), out);
+    if (out.empty()) return {false, 0.0f};
 
     // score to angle
     float *arr = reinterpret_cast<float *>(out.data);

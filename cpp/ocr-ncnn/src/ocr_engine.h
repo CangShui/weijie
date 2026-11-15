@@ -21,7 +21,7 @@ class OCREngine
 public:
     OCREngine() = default;
     ~OCREngine() = default;
-    explicit OCREngine(const std::string &config_path);
+    explicit OCREngine(const std::string &config_path, const std::string &profile = std::string());
 
     // enable move
     OCREngine(OCREngine &&other) noexcept;
@@ -31,7 +31,7 @@ public:
     OCREngine(const OCREngine &) = delete;
     OCREngine & operator = (const OCREngine &) = delete;
 
-    bool Initialize(const std::string &config_path);
+    bool Initialize(const std::string &config_path, const std::string &profile = std::string());
 
     std::vector<OCRResult> Run(const cv::Mat &image) const;
 

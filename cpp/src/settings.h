@@ -16,6 +16,7 @@ struct Settings {
     std::wstring recent_colors;
     std::wstring ocr_backend = L"auto";
     std::wstring ocr_engine = L"ppocr";
+    std::wstring ocr_ppocr_profile = L"small";   // tiny / small / medium
     std::wstring ocr_benchmark;
     bool ocr_enabled = false;
     int ocr_idle_minutes = 0;             // 0 = off

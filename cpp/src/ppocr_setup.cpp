@@ -13,9 +13,9 @@ namespace {
 
 constexpr wchar_t kPackageUrl[] =
     L"https://github.com/CangShui/weijie/releases/download/models/weijie-ocr-ncnn.zip";
-constexpr unsigned long long kPackageSize = 44443680ull;
+constexpr unsigned long long kPackageSize = 146397538ull;
 constexpr wchar_t kPackageSha256[] =
-    L"69925d18971adaf086ef7800589ef0b1bc65a158452f5056be93a0d082aa469c";
+    L"d9c9a0c098fde203f3078baee02d68850e1d60f70ada51642b606c6e4f658ad7";
 
 std::thread worker;
 std::atomic<bool> cancel{false};
@@ -35,14 +35,19 @@ bool file_exists(const std::wstring& path) {
 
 bool dir_ready(const std::wstring& dir) {
     if (dir.empty()) return false;
+    // ncnn is linked into the sidecar; only the OpenCV runtime is external.
     for (const wchar_t* name : {
-             L"ocr_ncnn.exe", L"ncnn.dll", L"opencv_world4110.dll",
+             L"ocr_ncnn.exe", L"opencv_world4110.dll",
              L"config-cpu.json", L"config-gpu.json",
              L"models\\PP_OCRv6_small_det.param", L"models\\PP_OCRv6_small_det.bin",
              L"models\\PP_OCRv6_small_rec.param", L"models\\PP_OCRv6_small_rec.bin",
              L"models\\PP_LCNet_x0_25_textline_ori.param",
              L"models\\PP_LCNet_x0_25_textline_ori.bin",
-             L"models\\ppocr_keys_v6.txt"}) {
+             L"models\\ppocr_keys_v6.txt",
+             L"models\\PP-OCRv6_tiny_det.param", L"models\\PP-OCRv6_tiny_rec.param",
+             L"models\\PP-OCRv6_vocab_tiny.txt",
+             L"models\\PP-OCRv6_medium_det.param", L"models\\PP-OCRv6_medium_rec.param",
+             L"models\\PP-OCRv6_vocab.txt"}) {
         if (!file_exists(dir + L"\\" + name)) return false;
     }
     return true;
@@ -82,7 +87,7 @@ bool ppocr_component_ready() {
 }
 
 std::wstring ppocr_component_status_text() {
-    if (ppocr_component_ready()) return L"PP-OCRv6 基础模型已安装，可直接识别。";
+    if (ppocr_component_ready()) return L"PP-OCRv6 已安装：tiny / small / medium 三档可选。";
     return L"OCR 组件未安装。点击下方按钮下载组件和 PP-OCRv6 模型。";
 }
 

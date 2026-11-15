@@ -1,3 +1,15 @@
+# 微截 1.8.0
+
+PP-OCRv6 的检测与识别预处理改为按档位自适应，同一套 ncnn 组件可运行 tiny / small / medium 三档模型。
+
+- 侧车从模型 `.param` 读取实际输入输出层名，不再假定 `input` / `output`，medium 与 tiny 网络可直接加载。
+- 词典按 PaddleOCR 的类别顺序归一：补齐 CTC blank 与末尾空格行，tiny / medium 自带词典可直接使用。
+- 识别输入高度、检测边长、阈值等按档位在 `config-gpu.json` / `config-cpu.json` 的 `profiles` 中覆盖。
+- 设置页新增「模型档位」下拉框，可选 tiny（约 6 MB）/ small（约 15 MB）/ medium（约 138 MB），默认 small。
+- OCR 组件包更新为三档权重齐全的版本，大小 139.6 MB，SHA-256 `d9c9a0c098fde203f3078baee02d68850e1d60f70ada51642b606c6e4f658ad7`。
+- 组件完整性检查同时覆盖三档权重，旧组件会提示重新下载。
+- 其余功能与 1.7.3 相同。
+
 # 微截 1.7.3
 
 - 已保存的翻译模型若指向 OCR 权重（HunyuanOCR-* / mmproj-*），翻译时自动改用默认 Index Q4，不再输出乱码。
@@ -32,7 +44,7 @@
 - 完全移除联网翻译：不再请求 MyMemory 或 OpenAI 兼容接口，旧 `llm_*` 配置读取后忽略并写入日志。
 - 新增 Haidass 143M、Qwen3.5 0.8B、Index-Translate 2B Q4_K_M 与 Q8 四个本地翻译模型，默认为 Index Q4_K_M。
 - 模型下拉框显示文件名与权重体积；「导入模型」把任意 `.gguf` 复制到 `models\weights`，源文件不动，同名先询问覆盖。
-- 仓库不再跟踪 44 MB 的 `runtime/weijie-ocr-ncnn.zip`，全部模型与运行时改放
+- 仓库不再跟踪 OCR 组件包，全部模型与运行时改放
   <https://github.com/CangShui/weijie/releases/tag/models>。
 
 ## 模型与运行时
@@ -40,7 +52,7 @@
 | 资产 | 体积 | 用途 |
 |---|---:|---|
 | `weijie-llama-runtime.zip` | 36 MB | llama.cpp Vulkan 运行时，识别与翻译共用 |
-| `weijie-ocr-ncnn.zip` | 42 MB | PP-OCRv6 small + ncnn Vulkan 组件 |
+| `weijie-ocr-ncnn.zip` | 140 MB | PP-OCRv6 tiny / small / medium + ncnn Vulkan 组件 |
 | `HunyuanOCR-Q8_0.gguf` + `mmproj-HunyuanOCR-Q8_0.gguf` | 1.25 GB | 混元 OCR 高精度 |
 | `HunyuanOCR-Q3_K_S.gguf` + mmproj | 972 MB | 混元 OCR 轻量 |
 | `Haidass-Translate-143M.Q8_0.gguf` | 147 MB | 中英双向翻译 |

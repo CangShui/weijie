@@ -26,6 +26,39 @@
         "model_path": "models/PP_OCRv6_small_rec",
         "keys_path": "models/ppocr_keys_v6.txt",
         "fp16": false,
-        "use_vulkan": false
+        "use_vulkan": false,
+        "target_h": 48
+    },
+    "profiles": {
+        "tiny": {
+            "det": {
+                "model_path": "models/PP-OCRv6_tiny_det"
+            },
+            "rec": {
+                "model_path": "models/PP-OCRv6_tiny_rec",
+                "keys_path": "models/PP-OCRv6_vocab_tiny.txt",
+                "target_h": 48
+            }
+        },
+        "small": {
+            "det": {
+                "model_path": "models/PP_OCRv6_small_det"
+            },
+            "rec": {
+                "model_path": "models/PP_OCRv6_small_rec",
+                "keys_path": "models/ppocr_keys_v6.txt",
+                "target_h": 48
+            }
+        },
+        "medium": {
+            "det": {
+                "model_path": "models/PP-OCRv6_medium_det"
+            },
+            "rec": {
+                "model_path": "models/PP-OCRv6_medium_rec",
+                "keys_path": "models/PP-OCRv6_vocab.txt",
+                "target_h": 48
+            }
+        }
     }
 }
