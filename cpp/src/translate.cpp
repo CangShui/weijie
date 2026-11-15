@@ -267,10 +267,12 @@ void strip_ansi(std::wstring& text) {
 std::wstring extract_answer(std::wstring raw, const std::wstring& prompt) {
     strip_ansi(raw);
     normalize_newlines(raw);
+    std::wstring needle = prompt;
+    normalize_newlines(needle);
     size_t stats = raw.find(L"[ Prompt:");
     if (stats != std::wstring::npos) raw.resize(stats);
-    size_t echo = raw.rfind(prompt);
-    if (echo != std::wstring::npos) raw = raw.substr(echo + prompt.size());
+    size_t echo = raw.rfind(needle);
+    if (echo != std::wstring::npos) raw = raw.substr(echo + needle.size());
     size_t exiting = raw.rfind(L"Exiting...");
     if (exiting != std::wstring::npos) raw.resize(exiting);
     trim_inplace(raw);
@@ -304,6 +306,7 @@ TranslateResult translate_text(const std::wstring& text, const Settings& cfg) {
     TranslateResult result;
     LogTrace trace;
     std::wstring body = text;
+    normalize_newlines(body);
     trim_inplace(body);
     if (body.empty()) {
         result.err = L"没有可翻译的文字";

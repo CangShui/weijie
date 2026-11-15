@@ -30,7 +30,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.7.1"
+#define APP_VERSION L"1.7.2"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101
@@ -504,6 +504,11 @@ static std::wstring selected_translate_file(CfgDlg*d){
  const int index=(int)SendMessageW(d->translateModel,CB_GETCURSEL,0,0);
  return index>=0&&index<(int)d->translateFiles.size()?d->translateFiles[index].name:g_cfg.translate_model;
 }
+static bool is_ocr_weight(const std::wstring& name){
+ std::wstring lower=name;
+ for(wchar_t& c:lower)c=(wchar_t)towlower(c);
+ return lower.rfind(L"mmproj",0)==0||lower.find(L"hunyuanocr")!=std::wstring::npos;
+}
 static void rebuild_translate_models(CfgDlg*d){
  if(!d->translateModel)return;
  const std::wstring keep=selected_translate_file(d);
@@ -519,6 +524,7 @@ static void rebuild_translate_models(CfgDlg*d){
  }
  const auto installed=list_gguf_models();
  for(const auto& file:installed){
+  if(is_ocr_weight(file.name))continue;
   bool known=false;
   for(const auto& item:translate_catalog())if(item.file==file.name){known=true;break;}
   if(known)continue;
