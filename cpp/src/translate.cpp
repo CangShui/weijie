@@ -314,10 +314,17 @@ TranslateResult translate_text(const std::wstring& text, const Settings& cfg) {
         return result;
     }
     detect(body, result.src, result.dst);
-    const std::wstring model = weights_dir() + L"\\" + cfg.translate_model;
+    std::wstring model_name = cfg.translate_model;
+    std::wstring lower = model_name;
+    for (wchar_t& c : lower) c = (wchar_t)towlower(c);
+    if (lower.find(L"hunyuanocr") != std::wstring::npos || lower.rfind(L"mmproj", 0) == 0) {
+        model_name = L"Index-Translate-2B.Q4_K_M.gguf";
+        logf(L"翻译配置指向 OCR 权重，改用默认翻译模型：原=%s", cfg.translate_model.c_str());
+    }
+    const std::wstring model = weights_dir() + L"\\" + model_name;
     logf(L"本地翻译请求到达：模型=%s 字符数=%zu 方向=%s->%s",
-         cfg.translate_model.c_str(), body.size(), result.src.c_str(), result.dst.c_str());
-    if (cfg.translate_model.empty()) {
+         model_name.c_str(), body.size(), result.src.c_str(), result.dst.c_str());
+    if (model_name.empty()) {
         result.err = L"未选择翻译模型，请在设置中下载或导入 GGUF 模型";
         logf(L"本地翻译被拒绝：未选择模型");
         return result;
