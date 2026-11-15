@@ -27,8 +27,8 @@ $Tests = Join-Path $Release 'Tests'
 $Reports = Join-Path $Release 'verification'
 $RuntimeNames = @('images')
 $AppSources = @('main', 'autostart', 'overlay', 'annotate', 'capture', 'desktop_duplication', 'longshot', 'ocr',
-    'fast_ocr', 'style_popup', 'ocr_setup', 'ppocr_setup', 'translate', 'pin', 'output',
-    'settings', 'common', 'emoji_renderer', 'emoji_popup', 'animated_image') |
+    'fast_ocr', 'style_popup', 'ocr_setup', 'ppocr_setup', 'translate', 'models', 'download',
+    'pin', 'output', 'settings', 'common', 'emoji_renderer', 'emoji_popup', 'animated_image') |
     ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
 $Resource = Join-Path $Root 'cpp\src\app.rc'
 $ResourceText = Get-Content -LiteralPath $Resource -Raw -Encoding UTF8
@@ -178,11 +178,17 @@ function Ensure-OcrRuntime {
     if (Test-Path -LiteralPath (Join-Path $dir 'ocr_ncnn.exe')) { return $dir }
     $zip = Join-Path $Root 'runtime\weijie-ocr-ncnn.zip'
     if (-not (Test-Path -LiteralPath $zip)) {
-        throw 'runtime\weijie-ocr-ncnn.zip is missing; cannot stage OCR tests.'
+        $zip = Join-Path $Root '_staging\models\weijie-ocr-ncnn.zip'
+    }
+    if (-not (Test-Path -LiteralPath $zip)) {
+        $zip = Join-Path $env:TEMP 'weijie-ocr-ncnn.zip'
+        Write-Host 'Downloading weijie-ocr-ncnn.zip from the models release'
+        Invoke-WebRequest -Uri 'https://github.com/CangShui/weijie/releases/download/models/weijie-ocr-ncnn.zip' `
+            -OutFile $zip
     }
     Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
     if (-not (Test-Path -LiteralPath (Join-Path $dir 'ocr_ncnn.exe'))) {
-        throw 'Failed to extract runtime\weijie-ocr-ncnn.zip'
+        throw 'Failed to extract weijie-ocr-ncnn.zip'
     }
     return $dir
 }
@@ -270,7 +276,8 @@ function Package-Application {
 function Invoke-CoreTest([string]$Argument, [string]$Label) {
     $temporary = Join-Path $App '_core_tests.exe'
     $sources = @('settings', 'common', 'autostart', 'output', 'longshot', 'pin', 'ocr', 'desktop_duplication',
-        'fast_ocr', 'style_popup', 'emoji_renderer', 'ocr_setup', 'annotate', 'animated_image') |
+        'fast_ocr', 'style_popup', 'emoji_renderer', 'ocr_setup', 'models', 'download',
+        'annotate', 'animated_image') |
         ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
     if (-not $script:CoreCompiled) {
         Compile-Target 'core' (@((Join-Path $Root 'cpp\tests\core_tests.cpp')) + $sources) `
@@ -312,7 +319,7 @@ function Invoke-OcrLifecycleTest {
     $exe = Join-Path $Tests 'ocr_lifecycle_tests.exe'
     Compile-Target 'ocr-fixture' @((Join-Path $Root 'cpp\tests\ocr_worker_fixture.cpp')) `
         $fixture $false $false
-    $sources = @('settings', 'common', 'ocr', 'fast_ocr', 'ocr_setup') |
+    $sources = @('settings', 'common', 'ocr', 'fast_ocr', 'ocr_setup', 'models', 'download') |
         ForEach-Object { Join-Path $Root "cpp\src\$_.cpp" }
     Compile-Target 'ocr-lifecycle' (@((Join-Path $Root 'cpp\tests\ocr_lifecycle_tests.cpp')) + $sources) `
         $exe $false $false

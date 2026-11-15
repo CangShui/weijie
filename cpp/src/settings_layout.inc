@@ -23,9 +23,9 @@ static void cfg_paint(CfgDlg*d,HDC dc){
     Pen icon(Color::White,SF(1.5));g.DrawRectangle(&icon,SF(32),SF(35),SF(14),SF(12));
     ui::text(g,L"微截",r(66,23,112,32),20,ui::ink(),true);
     ui::text(g,L"让截图更简单",r(24,64,156,22),12,ui::muted());
-    ui::text(g,L"1.5  ·  原生桌面版",r(24,524,156,25),11,ui::muted());
+    ui::text(g,L"1.7  ·  原生桌面版",r(24,524,156,25),11,ui::muted());
     const wchar_t* names[]={L"截图与快捷键",L"文字识别",L"翻译服务"};
-    const wchar_t* desc[]={L"按你的习惯，设置每一次截图",L"本地识别，按需启用",L"为提取的文字选择翻译服务"};
+    const wchar_t* desc[]={L"按你的习惯，设置每一次截图",L"本地识别，按需启用",L"本地模型翻译，不联网"};
     ui::text(g,names[d->page],r(228,21,560,34),21,ui::ink(),true);
     ui::text(g,desc[d->page],r(228,58,560,23),12,ui::muted());
     ui::box(g,r(204,100,612,458),Color::White,12,ui::line());
@@ -35,9 +35,9 @@ static void cfg_paint(CfgDlg*d,HDC dc){
     }else if(d->page==1){
         ui::separator(g,226,216,568);
     }else{
-        ui::box(g,r(226,190,568,62),ui::tint(),8);
-        ui::text(g,L"仅点击“翻译”时发送识别文字，截图始终保留在本地。\nAPI Key 留空时使用 MyMemory 翻译服务。",
-                 r(242,198,536,46),12,Color(255,33,116,72));
+        ui::box(g,r(226,404,568,64),ui::tint(),8);
+        ui::text(g,L"翻译在本机完成，截图和文字不会离开这台电脑。\n运行时与 OCR 共用 models\\runtime。",
+                 r(242,412,536,48),12,Color(255,33,116,72));
     }
     // Rounded borders behind native input controls.
     for(HWND h:d->pages[d->page]){
@@ -104,7 +104,7 @@ static void cfg_layout(CfgDlg*d){
     }
     label(d,1,L"识别引擎",226,239,132);
     d->ocrEngine=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,231,418,200,109);
-    for(auto t:{L"混元 OCR · 高精度 Q8",L"混元 OCR · 轻量 Q3",L"PP-OCRv6 · ncnn Vulkan · 极速"})SendMessageW(d->ocrEngine,CB_ADDSTRING,0,(LPARAM)t);
+    for(auto t:{L"混元 OCR · 高精度 Q8（551 MB）",L"混元 OCR · 轻量 Q3（272 MB）",L"PP-OCRv6 · ncnn Vulkan（42 MB）"})SendMessageW(d->ocrEngine,CB_ADDSTRING,0,(LPARAM)t);
     SendMessageW(d->ocrEngine,CB_SETCURSEL,g_cfg.ocr_engine==L"ppocr"?2:g_cfg.ocr_engine==L"hunyuan_fast"?1:0,0);
     label(d,1,L"推理设备",226,287,132);
     d->ocrBackend=control(d,1,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,279,418,200,110);
@@ -119,7 +119,7 @@ static void cfg_layout(CfgDlg*d){
                  g_cfg.ocr_backend==L"gpu"?(gpuAvailable?2:1):g_cfg.ocr_backend==L"cpu"?1:0,0);
     setting_hint(d,1,L"空闲超时释放模型；不打断识别，下次调用按需加载。",226,330,566,22);
     setting_hint(d,1,L"GPU 使用 Vulkan：支持 Intel / AMD / NVIDIA；无 Vulkan 驱动时自动回退 CPU。",226,352,566,22);
-    d->ocrBench=control(d,1,L"STATIC",L"PP-OCRv6 组件与模型按需下载；混元模型地址不变。",0,226,378,566,24);
+    d->ocrBench=control(d,1,L"STATIC",L"运行时与权重安装在程序目录 models 下，来源为 GitHub 模型发布页。",0,226,378,566,24);
     d->ocrStatus=control(d,1,L"STATIC",L"",0,226,404,566,40,105);
     d->ocrProgress=control(d,1,PROGRESS_CLASSW,L"",PBS_SMOOTH,226,450,566,6);
     SendMessageW(d->ocrProgress,PBM_SETRANGE32,0,100);
@@ -129,17 +129,20 @@ static void cfg_layout(CfgDlg*d){
     setting_hint(d,1,L"下载前请阅读随程序提供的模型许可。",226,520,566,24);
 
     d->translateEnabled=setting_check(d,2,L"显示翻译按钮",226,115,550,17,g_cfg.translate_enabled);
-    setting_hint(d,2,L"独立显示翻译按钮；识别关闭时仍可翻译已有文字，不加载模型。",226,154,566,25);
-    label(d,2,L"接口地址",226,282,132);
-    d->base=setting_edit(d,2,374,274,418,106);
-    label(d,2,L"API Key",226,342,132);
-    d->key=setting_edit(d,2,374,334,418,107,true);
-    label(d,2,L"模型名称",226,402,132);
-    d->model=setting_edit(d,2,374,394,418,108);
-    SetWindowTextW(d->base,g_cfg.llm_base.c_str());SetWindowTextW(d->key,g_cfg.llm_key.c_str());SetWindowTextW(d->model,g_cfg.llm_model.c_str());
-    setting_hint(d,2,L"兼容 OpenAI 格式的翻译接口。",374,444,418,26);
-    setting_hint(d,2,L"密钥保存在当前用户配置中，请勿分享设置文件。",226,492,566,44);
+    setting_hint(d,2,L"翻译完全在本机运行，不发送截图或文字；识别关闭时仍可翻译已有结果。",226,154,566,25);
+    label(d,2,L"翻译模型",226,196,132);
+    d->translateModel=control(d,2,L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_TABSTOP,374,188,418,240,112);
+    control(d,2,L"BUTTON",L"导入模型",WS_TABSTOP,374,232,120,34,12);
+    d->translateDownload=control(d,2,L"BUTTON",L"下载 / 校验模型",WS_TABSTOP,506,232,180,34,13);
+    d->translateStatus=control(d,2,L"STATIC",L"",SS_LEFT,226,278,566,44,113);
+    d->translateProgress=control(d,2,PROGRESS_CLASSW,L"",PBS_SMOOTH,226,330,566,6);
+    SendMessageW(d->translateProgress,PBM_SETRANGE32,0,100);
+    SendMessageW(d->translateProgress,PBM_SETBARCOLOR,0,RGB(7,193,96));
+    SendMessageW(d->translateProgress,PBM_SETBKCOLOR,0,RGB(232,239,234));
+    setting_hint(d,2,L"模型文件保存在程序目录 models\\weights；导入只复制文件，原文件保持不变。",226,344,566,24);
+    setting_hint(d,2,L"下拉框显示文件名与权重体积；模型越大，速度越慢、内存占用越高。",226,368,566,24);
     control(d,-1,L"BUTTON",L"取消",WS_TABSTOP,596,594,94,34,2);
     control(d,-1,L"BUTTON",L"保存设置",WS_TABSTOP|BS_DEFPUSHBUTTON,702,594,114,34,1);
-    choose_page(d);refresh_download(d);SetTimer(d->hwnd,60,400,nullptr);
+    rebuild_translate_models(d);choose_page(d);refresh_download(d);refresh_translate(d);
+    SetTimer(d->hwnd,60,400,nullptr);
 }

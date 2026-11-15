@@ -207,11 +207,11 @@ Settings load_settings() {
         logf(L"读取设置：OCR 空闲回收分钟=%d 不在0/1/10/60/720/1440范围，使用off",idle);
     }
     s.translate_enabled = get_json_bool(js, "translate_enabled", s.translate_enabled);
-    if (!(v = get_json_str(js, "ocr_model_dir")).empty()) s.ocr_model_dir = u8_to_w(v);
-    if (!(v = get_json_str(js, "llm_base")).empty())   s.llm_base = u8_to_w(v);
-    if (!(v = get_json_str(js, "llm_model")).empty())  s.llm_model = u8_to_w(v);
-    v = get_json_str(js, "llm_key");
-    s.llm_key = u8_to_w(v);   // 允许为空
+    if (!(v = get_json_str(js, "translate_model")).empty()) s.translate_model = u8_to_w(v);
+    if (!get_json_str(js, "llm_base").empty() || !get_json_str(js, "llm_key").empty()) {
+        LogTrace trace;
+        logf(L"读取设置：旧版联网翻译配置已停用，翻译改为本地模型推理");
+    }
     return s;
 }
 
@@ -243,10 +243,7 @@ bool save_settings(const Settings& s) {
     js += "  \"ocr_enabled\": " + std::string(s.ocr_enabled ? "true" : "false") + ",\n";
     js += "  \"ocr_idle_minutes\": " + std::to_string(s.ocr_idle_minutes) + ",\n";
     js += "  \"translate_enabled\": " + std::string(s.translate_enabled ? "true" : "false") + ",\n";
-    js += "  \"ocr_model_dir\": \"" + json_escape(w_to_u8(s.ocr_model_dir)) + "\",\n";
-    js += "  \"llm_base\": \"" + json_escape(w_to_u8(s.llm_base)) + "\",\n";
-    js += "  \"llm_key\": \"" + json_escape(w_to_u8(s.llm_key)) + "\",\n";
-    js += "  \"llm_model\": \"" + json_escape(w_to_u8(s.llm_model)) + "\"\n";
+    js += "  \"translate_model\": \"" + json_escape(w_to_u8(s.translate_model)) + "\"\n";
     js += "}\n";
 
     std::wstring path = settings_path();

@@ -293,8 +293,8 @@ int wmain(int argc,wchar_t**argv){
   check(save_bitmap_direct(&veryTall,dir,L"bmp",92,direct),"save BMP at the supported encoder height boundary");
  }
  if(argc>1&&std::wstring(argv[1])==L"--ocr"){
-   s.ocr_enabled=true;s.ocr_engine=L"hunyuan";s.ocr_model_dir=std::wstring(_wgetenv(L"LOCALAPPDATA"))+L"\\weijie\\hunyuan-ocr";save_settings(s);
-  hunyuan_download_models_async();while(hunyuan_download_state().busy)Sleep(100);hunyuan_download_shutdown();
+   s.ocr_enabled=true;s.ocr_engine=L"hunyuan";save_settings(s);
+  hunyuan_download_models_async(false);while(hunyuan_download_state().busy)Sleep(100);hunyuan_download_shutdown();
   check(hunyuan_model_ready(),"model hash validation and readiness");
   Gdiplus::Bitmap image(800,260,PixelFormat32bppRGB);{Gdiplus::Graphics g(&image);g.Clear(Gdiplus::Color::White);Gdiplus::Font font(L"Microsoft YaHei",30);Gdiplus::SolidBrush ink(Gdiplus::Color::Black);g.DrawString(L"Hello 123\n混元 OCR 测试",-1,&font,Gdiplus::PointF(20,20),&ink);}
   std::wstring out,err;bool ok=ocr_recognize(&image,out,err);check(ok,"real Hunyuan inference");check(out.find(L"Hello 123")!=std::wstring::npos&&out.find(L"混元")!=std::wstring::npos,"bilingual OCR output");

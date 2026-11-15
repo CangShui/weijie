@@ -20,10 +20,7 @@ struct Settings {
     bool ocr_enabled = false;
     int ocr_idle_minutes = 0;             // 0 = off
     bool translate_enabled = true;
-    std::wstring ocr_model_dir;           // empty = %LOCALAPPDATA%\weijie\hunyuan-ocr
-    std::wstring llm_base  = L"https://api.deepseek.com/v1";
-    std::wstring llm_key;
-    std::wstring llm_model = L"deepseek-chat";
+    std::wstring translate_model = L"Index-Translate-2B.Q4_K_M.gguf";
 };
 
 Settings load_settings();

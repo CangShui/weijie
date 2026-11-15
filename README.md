@@ -1,8 +1,10 @@
 # 微截 · 源码仓库
 
-原生 C++20 / Win32 / GDI+ 截图工具。基础产物不包含 OCR 组件；
-用户在设置「文字识别」页点击下载后，才会把 PP-OCRv6 small + ncnn Vulkan
-组件和模型安装到 `%LOCALAPPDATA%\weijie\ocr-ncnn`。
+原生 C++20 / Win32 / GDI+ 截图工具。基础产物不包含模型与运行时；
+权重统一放在程序目录 `models\weights`，运行时放在 `models\runtime`，
+文字识别与本地翻译共用同一套 llama.cpp / ncnn 运行时，全部从
+<https://github.com/CangShui/weijie/releases/tag/models> 按需下载。
+识别和翻译都在本机完成，不联网发送截图或文字。
 
 「文字识别」页的「空闲自动回收」可选 `off`、`1分钟`、`10分钟`、`1小时`、
 `12小时`、`24小时`，默认 `off`，保存后生效。从最后一次识别结束开始计时，
@@ -18,7 +20,6 @@ assets/                     图标与源素材
 cpp/src/                    当前原生 C++ 源码
 cpp/tests/                  核心测试与原生 UI 快照测试
 cpp/ocr-ncnn/               PP-OCRv6 ncnn sidecar 源码
-runtime/weijie-ocr-ncnn.zip PP-OCRv6 small + ncnn Vulkan 组件与模型（设置页下载源）
 runtime/ocr-ncnn/           开发机解压后的 OCR 组件（本地测试用，不入库）
 runtime/images/default/     默认图片素材（可删除、可添加其他分组）
 docs/                       发布说明、源项目文档
@@ -44,13 +45,14 @@ build.bat -Task Deploy
 `-Task Deploy` 关闭 `C:\Program Files\weijie` 中的实例、替换可执行文件，再以管理员身份启动新版本。
 开机时托盘尚未就绪会每 2 秒重试注册，任务栏重建后自动恢复图标，不影响截图快捷键。
 需要更换安装目录时直接运行 `scripts\deploy-installed.ps1 -Target <目录>`。
-CPU / GPU 测试会自动从 `runtime\weijie-ocr-ncnn.zip` 解压组件到测试目录，
+CPU / GPU 测试会自动准备 `runtime\ocr-ncnn`（本地缺失时从 models Release 下载 ZIP），
 测试结束后再移除，保证最终发布目录仍然是最小产物。
 
 输出结构：
 
 ```text
 Release/weijie/             最小运行包：微截.exe、images、快捷方式
+                            安装后按需创建 models\weights 与 models\runtime
 Release/Tests/              核心测试和 UI 测试程序
 Release/verification/       测试日志、UI 快照
 Release/.build/             编译中间文件，可安全清理
@@ -72,9 +74,20 @@ Release/archives/           可选 ZIP 包
 设置窗口打开时仍可截图，未保存的设置内容会保留；只有正在快捷键录入框中录入组合键时暂停触发。
 「启用文字识别（主开关）」关闭后立即中止识别并退出本程序的 OCR 模型进程，
 释放模型内存和显存，同时隐藏识别按钮；模型文件仍保留在磁盘。
-关闭期间，图片翻译等入口也不会重新加载模型。翻译按钮仍独立显示，已有文字可直接翻译。
+关闭期间，图片翻译不会重新加载 OCR 模型；翻译按钮仍独立显示，已有文字直接用本地翻译模型处理。
 开启主开关并保存后，下次识别才按需重新加载模型；启用期间连续识别复用同一进程。
 取消设置会恢复原来的开关权限，但不会预加载模型。组件缺失只在使用时提示，不阻止保存设置。
+
+### 本地翻译
+
+「翻译服务」页使用本地 GGUF 模型：下拉框列出内置模型与 `models\weights` 中的任意模型，
+并显示权重体积（Haidass 143M 约 147 MB、Qwen3.5 0.8B 约 795 MB、
+Index-Translate 2B 约 1.25 GB / 1.98 GB）。选中的模型缺失时，按钮下载权重和共用运行时，
+支持断点续传、多线程和 SHA-256 校验；已完整下载的文件只校验，不重复下载。
+
+「导入模型」把选中的 `.gguf` 复制到 `models\weights`，源文件保持不动，同名文件先询问覆盖。
+翻译与识别共用 `models\runtime\llama`，任一侧下载后另一侧无需重复下载。
+翻译调用 `llama-cli` 单轮对话，按模型自身模板构造提示，超过 900 字的文本分段串行处理。
 
 ### 截图唤起速度
 

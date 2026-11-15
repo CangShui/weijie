@@ -280,6 +280,11 @@ bool ocr_recognize(Gdiplus::Bitmap* bmp, std::wstring& text, std::wstring& err, 
     const bool useGpu = s.ocr_backend==L"gpu" &&
                         (gpu_ocr_supported() || fast_ocr_gpu_available());
     std::wstring runtime = useGpu ? hunyuan_runtime_dir(true) : hunyuan_runtime_dir(false);
+    if (runtime.empty()) {
+        err = L"模型运行时未安装，请在设置中下载 OCR 模型";
+        logf(L"识别请求未执行：运行时缺失");
+        return false;
+    }
     std::wstring model = s.ocr_engine==L"hunyuan_fast" ? L"HunyuanOCR-Q3_K_S.gguf" : L"HunyuanOCR-Q8_0.gguf";
     wchar_t temp[MAX_PATH]{}, unique[MAX_PATH]{};
     if (!GetTempPathW(MAX_PATH, temp) ||

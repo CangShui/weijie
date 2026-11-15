@@ -102,6 +102,30 @@ std::wstring exe_path() {
     return buf;
 }
 
+std::wstring exe_dir() {
+    std::wstring exe = exe_path();
+    size_t pos = exe.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? L"." : exe.substr(0, pos);
+}
+
+std::wstring models_dir() {
+    std::wstring dir = exe_dir() + L"\\models";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+std::wstring weights_dir() {
+    std::wstring dir = models_dir() + L"\\weights";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+std::wstring runtime_root_dir() {
+    std::wstring dir = models_dir() + L"\\runtime";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
 bool process_is_elevated(HANDLE process) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;

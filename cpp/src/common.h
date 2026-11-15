@@ -39,6 +39,11 @@ std::string  json_escape(const std::string& s);
 std::wstring appdata_dir();       // %APPDATA%\weijie
 std::wstring localappdata_dir();  // %LOCALAPPDATA%\weijie
 std::wstring exe_path();
+std::wstring exe_dir();
+// 模型与运行时统一放在主程序目录下的 models 中，随安装目录迁移。
+std::wstring models_dir();        // <exe>\models
+std::wstring weights_dir();       // <exe>\models\weights
+std::wstring runtime_root_dir();  // <exe>\models\runtime
 bool process_is_elevated(HANDLE process);
 bool capture_requires_elevation(HWND foreground);
 void logf(const wchar_t* fmt, ...);

@@ -1,23 +1,19 @@
 #include "ppocr_setup.h"
+#include "download.h"
+#include "models.h"
 
-#include <winhttp.h>
-#include <bcrypt.h>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <thread>
 #include <atomic>
 #include <stdexcept>
 #include <vector>
 
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "bcrypt.lib")
-
 namespace {
 
 constexpr wchar_t kPackageUrl[] =
-    L"https://raw.githubusercontent.com/CangShui/weijie/main/runtime/weijie-ocr-ncnn.zip";
-// Filled with the SHA-256 of runtime/weijie-ocr-ncnn.zip.
+    L"https://github.com/CangShui/weijie/releases/download/models/weijie-ocr-ncnn.zip";
+constexpr unsigned long long kPackageSize = 44443680ull;
 constexpr wchar_t kPackageSha256[] =
     L"69925d18971adaf086ef7800589ef0b1bc65a158452f5056be93a0d082aa469c";
 
@@ -52,116 +48,11 @@ bool dir_ready(const std::wstring& dir) {
     return true;
 }
 
-std::wstring exe_dir() {
-    std::wstring exe = exe_path();
-    size_t pos = exe.find_last_of(L"\\/");
-    return pos == std::wstring::npos ? L"." : exe.substr(0, pos);
-}
-
-bool sha256_file(const std::wstring& path, std::wstring& hex) {
-    BCRYPT_ALG_HANDLE alg{};
-    BCRYPT_HASH_HANDLE hash{};
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
-    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) < 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return false;
-    }
-    std::ifstream f(std::filesystem::path(path), std::ios::binary);
-    std::vector<char> buf(1024 * 1024);
-    bool ok = bool(f);
-    while (f && !cancel) {
-        f.read(buf.data(), buf.size());
-        auto n = f.gcount();
-        if (n > 0 && BCryptHashData(hash, (PUCHAR)buf.data(), (ULONG)n, 0) < 0) {
-            ok = false;
-            break;
-        }
-    }
-    unsigned char digest[32]{};
-    ok = ok && f.eof() && !cancel && BCryptFinishHash(hash, digest, 32, 0) >= 0;
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    if (!ok) return false;
-    const char* digits = "0123456789abcdef";
-    hex.clear();
-    for (auto b : digest) {
-        hex.push_back((wchar_t)digits[b >> 4]);
-        hex.push_back((wchar_t)digits[b & 15]);
-    }
-    return true;
-}
-
-struct Http {
-    HINTERNET h{};
-    ~Http() { if (h) WinHttpCloseHandle(h); }
-    operator HINTERNET() const { return h; }
-};
-
-bool download_package(const std::wstring& target) {
-    URL_COMPONENTS u{};
-    u.dwStructSize = sizeof(u);
-    u.dwHostNameLength = (DWORD)-1;
-    u.dwUrlPathLength = (DWORD)-1;
-    if (!WinHttpCrackUrl(kPackageUrl, 0, 0, &u)) return false;
-    std::wstring host(u.lpszHostName, u.dwHostNameLength);
-    std::wstring resource(u.lpszUrlPath, u.dwUrlPathLength);
-
-    Http session{WinHttpOpen(L"weijie/1.5", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!session.h) {
-        session.h = WinHttpOpen(L"weijie/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    }
-    if (!session.h) return false;
-    WinHttpSetTimeouts(session, 20000, 20000, 20000, 20000);
-    Http conn{WinHttpConnect(session, host.c_str(), u.nPort, 0)};
-    if (!conn.h) return false;
-    Http req{WinHttpOpenRequest(conn, L"GET", resource.c_str(), nullptr, nullptr,
-                                WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)};
-    if (!req.h) return false;
-    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(req, nullptr)) {
-        return false;
-    }
-    DWORD status = 0, len = sizeof(status);
-    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
-    if (status != 200) return false;
-
-    unsigned long long total = 0;
-    len = sizeof(total);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &total, &len, WINHTTP_NO_HEADER_INDEX)) {
-        total = 0;
-    }
-
-    std::ofstream f(std::filesystem::path(target), std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    char buf[65536];
-    unsigned long long offset = 0;
-    DWORD got = 0;
-    while (!cancel) {
-        if (!WinHttpReadData(req, buf, sizeof(buf), &got)) break;
-        if (!got) break;
-        f.write(buf, (std::streamsize)got);
-        if (!f) return false;
-        offset += got;
-        if (total) update(L"正在下载 OCR 组件  " + std::to_wstring(offset * 90 / total) + L"%",
-                          (int)(offset * 90 / total));
-    }
-    f.close();
-    return !cancel && offset > 0 && (!total || offset == total);
-}
-
 bool extract_package(const std::wstring& zip, const std::wstring& dest) {
     std::error_code ec;
     std::filesystem::remove_all(dest, ec);
     std::filesystem::create_directories(dest, ec);
     if (ec) return false;
-
     std::wstring cmd = L"tar.exe -xf \"" + zip + L"\" -C \"" + dest + L"\"";
     std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
     cmdline.push_back(0);
@@ -183,7 +74,7 @@ bool extract_package(const std::wstring& zip, const std::wstring& dest) {
 }  // namespace
 
 std::wstring ppocr_component_dir() {
-    return localappdata_dir() + L"\\ocr-ncnn";
+    return runtime_root_dir() + L"\\ppocr-ncnn";
 }
 
 bool ppocr_component_ready() {
@@ -213,31 +104,49 @@ void ppocr_download_async() {
     if (ppocr_download_state().busy) return;
     if (worker.joinable()) worker.join();
     if (ppocr_component_ready()) return;
-
     cancel = false;
     {
         std::lock_guard<std::mutex> guard(stateMutex);
         state = {true, 0, L"准备下载 OCR 组件…"};
     }
     worker = std::thread([] {
+        LogTrace trace;
+        logf(L"PP-OCR 组件下载请求到达");
         try {
-            std::wstring base = localappdata_dir() + L"\\downloads";
-            std::filesystem::create_directories(base);
-            std::wstring zip = base + L"\\weijie-ocr-ncnn.zip";
-            if (!download_package(zip)) throw std::runtime_error("download failed");
-            if (cancel) throw std::runtime_error("cancelled");
+            std::filesystem::create_directories(models_dir());
+            const std::wstring zip = models_dir() + L"\\weijie-ocr-ncnn.zip";
+            std::atomic<unsigned long long> done{0};
+            std::wstring error;
+            bool ok = download_file(kPackageUrl, zip, kPackageSize, cancel,
+                                    [&](unsigned long long bytes) {
+                                        done += bytes;
+                                        int percent = (int)(done.load() * 90 / kPackageSize);
+                                        update(L"正在下载 OCR 组件  " + human_size(done.load()) +
+                                                   L" / " + human_size(kPackageSize),
+                                               percent);
+                                    },
+                                    error);
+            if (!ok) {
+                if (cancel) throw std::runtime_error("cancel");
+                logf(L"PP-OCR 组件下载失败：%s", error.c_str());
+                throw std::runtime_error("download");
+            }
+            if (cancel) throw std::runtime_error("cancel");
             update(L"正在校验 OCR 组件…", 92);
-            std::wstring hash;
-            if (!sha256_file(zip, hash) || _wcsicmp(hash.c_str(), kPackageSha256) != 0) {
-                throw std::runtime_error("checksum failed");
+            if (!verify_sha256(zip, kPackageSha256)) {
+                DeleteFileW(zip.c_str());
+                logf(L"PP-OCR 组件 SHA-256 校验失败，已删除下载文件");
+                throw std::runtime_error("checksum");
             }
             update(L"正在安装 OCR 组件…", 96);
             if (!extract_package(zip, ppocr_component_dir())) {
-                throw std::runtime_error("extract failed");
+                logf(L"PP-OCR 组件解压失败：目标=%s", ppocr_component_dir().c_str());
+                throw std::runtime_error("extract");
             }
             std::filesystem::remove(zip);
             update(L"OCR 组件下载完成。", 100);
-        } catch (...) {
+            logf(L"PP-OCR 组件安装完成：%s", ppocr_component_dir().c_str());
+        } catch (const std::exception&) {
             update(cancel ? L"已取消下载。" : L"OCR 组件下载失败，请检查网络后重试。");
         }
         std::lock_guard<std::mutex> guard(stateMutex);

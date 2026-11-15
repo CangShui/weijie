@@ -1,3 +1,45 @@
+# 微截 1.7.0
+
+本版把文字识别与翻译统一为本地模型，模型目录迁到主程序文件夹，下载源改为 GitHub 模型发布页。
+
+## 本版亮点
+
+- 权重安装到 `models\weights`，运行时安装到 `models\runtime`；旧版 `%LOCALAPPDATA%` 下的权重与运行时会自动迁移，已存在的文件不覆盖。
+- 混元 OCR、PP-OCR 与本地翻译共用 llama.cpp / ncnn 运行时；下载支持 Range 断点续传、四线程分片与 SHA-256 校验。
+- 完全移除联网翻译：不再请求 MyMemory 或 OpenAI 兼容接口，旧 `llm_*` 配置读取后忽略并写入日志。
+- 新增 Haidass 143M、Qwen3.5 0.8B、Index-Translate 2B Q4_K_M 与 Q8 四个本地翻译模型，默认为 Index Q4_K_M。
+- 模型下拉框显示文件名与权重体积；「导入模型」把任意 `.gguf` 复制到 `models\weights`，源文件不动，同名先询问覆盖。
+- 仓库不再跟踪 44 MB 的 `runtime/weijie-ocr-ncnn.zip`，全部模型与运行时改放
+  <https://github.com/CangShui/weijie/releases/tag/models>。
+
+## 模型与运行时
+
+| 资产 | 体积 | 用途 |
+|---|---:|---|
+| `weijie-llama-runtime.zip` | 36 MB | llama.cpp Vulkan 运行时，识别与翻译共用 |
+| `weijie-ocr-ncnn.zip` | 42 MB | PP-OCRv6 small + ncnn Vulkan 组件 |
+| `HunyuanOCR-Q8_0.gguf` + `mmproj-HunyuanOCR-Q8_0.gguf` | 1.25 GB | 混元 OCR 高精度 |
+| `HunyuanOCR-Q3_K_S.gguf` + mmproj | 972 MB | 混元 OCR 轻量 |
+| `Haidass-Translate-143M.Q8_0.gguf` | 147 MB | 中英双向翻译 |
+| `Qwen3.5-0.8B-Q8_0.gguf` | 795 MB | 通用小模型翻译 |
+| `Index-Translate-2B.Q4_K_M.gguf` | 1.25 GB | 默认翻译模型 |
+| `Index-Translate-2B.Q8_0.gguf` | 1.98 GB | 近无损翻译 |
+
+下载会先写入分片再合并，取消或断网后保留已下载字节；完整文件只校验不重下。
+翻译调用 `llama-cli` 单轮对话，按模型自身模板构造提示；超过 900 字的文本分段串行处理。
+
+## 迁移与兼容
+
+- 首次启动迁移 `%LOCALAPPDATA%\weijie\hunyuan-ocr`、`ocr-ncnn` 以及旧 `ocr-runtime*` 目录；跨卷复制保留时间戳，`.verified` 标记继续有效。
+- 安装目录位于 Program Files 时，只有管理员实例能写入模型目录；便携版放在可写目录即可。
+- 未下载翻译模型时，设置页只提示缺失，不阻止保存其它设置。
+- 旧版设置中的 `llm_base`、`llm_key`、`llm_model` 不再写回，读取时记一条日志。
+
+## 验证
+
+- Core 94 项、UI 全量（托盘 13、设置保存 9、空闲回收 6、右键尺寸、文字与图案移动、GIF 等）与图像分组 8 项通过。
+- 本地翻译探针实机出译文：Haidass 143M 中→英、Qwen3.5 0.8B 中→英、Index Q4_K_M 中→英与英→中。
+
 # 微截 1.6.0
 
 本版完善 D3D 游戏截图、OCR 生命周期、图片素材分组、动态贴图、标注移动与截图唤起性能。

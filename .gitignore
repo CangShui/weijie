@@ -38,3 +38,6 @@ dist/*.exe
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- 本地模型暂存 ----
+_staging/

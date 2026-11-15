@@ -44,6 +44,7 @@ std::wstring find_runtime_dir() {
     size_t pos = exe.find_last_of(L"\\/");
     std::wstring root = pos == std::wstring::npos ? L"." : exe.substr(0, pos);
     const std::wstring ncnn_candidates[] = {
+        root + L"\\models\\runtime\\ppocr-ncnn",
         root + L"\\ocr-ncnn",
         localappdata_dir() + L"\\ocr-ncnn",
     };

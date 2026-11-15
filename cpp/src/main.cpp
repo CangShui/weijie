@@ -8,6 +8,9 @@
 #include "longshot.h"
 #include "fast_ocr.h"
 #include "ocr.h"
+#include "translate.h"
+#include "models.h"
+#include "download.h"
 #include "ui_theme.h"
 #include "hotkey_input.h"
 #include "autostart.h"
@@ -27,7 +30,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 #define APP_NAME    L"微截"
-#define APP_VERSION L"1.6.0"
+#define APP_VERSION L"1.7.0"
 
 // 与 src/app.rc 里的 IDI_APP 保持一致
 #define IDI_APP 101
@@ -428,7 +431,8 @@ struct CfgDlg {
  HWND autoCopy{}, includeCursor{}, autostart{}, stroke{}, fontSize{};
  HWND ocrEnabled{}, ocrStatus{}, ocrDownload{}, ocrProgress{}, ocrEngine{}, ocrBackend{}, ocrBench{}, ocrIdle{};
  HWND translateEnabled{};
- HWND base{}, key{}, model{};
+ HWND translateModel{}, translateImport{}, translateDownload{}, translateStatus{}, translateProgress{};
+ std::vector<GgufFile> translateFiles;
  HWND nav[3]{};
  std::vector<HWND> pages[3];
  bool done=false; int page=0; HFONT font{};
@@ -487,11 +491,70 @@ static void refresh_download(CfgDlg*d){
   return;
  }
  EnableWindow(d->ocrDownload,TRUE);
+ const bool fast=selected_ocr_engine(d)==1;
  auto state=hunyuan_download_state();
- std::wstring t=state.text.empty()?hunyuan_model_status_text():state.text;
+ std::wstring t=state.text.empty()
+     ?(fast?hunyuan_fast_model_status_text():hunyuan_model_status_text()):state.text;
  SetWindowTextW(d->ocrStatus,t.c_str());
  SetWindowTextW(d->ocrDownload,state.busy?L"取消下载":L"下载 / 校验模型");
  SendMessageW(d->ocrProgress,PBM_SETPOS,state.percent,0);
+}
+static std::wstring selected_translate_file(CfgDlg*d){
+ if(!d||!d->translateModel)return g_cfg.translate_model;
+ const int index=(int)SendMessageW(d->translateModel,CB_GETCURSEL,0,0);
+ return index>=0&&index<(int)d->translateFiles.size()?d->translateFiles[index].name:g_cfg.translate_model;
+}
+static void rebuild_translate_models(CfgDlg*d){
+ if(!d->translateModel)return;
+ const std::wstring keep=selected_translate_file(d);
+ SendMessageW(d->translateModel,CB_RESETCONTENT,0,0);
+ d->translateFiles.clear();
+ int select=-1;
+ for(const auto& item:translate_catalog()){
+  const unsigned long long have=disk_file_size(weights_dir()+L"\\"+item.file);
+  const std::wstring label=item.file+L"  ·  "+human_size(have?have:item.size)+(have?L"  ·  已下载":L"  ·  未下载");
+  d->translateFiles.push_back({item.file,item.size});
+  SendMessageW(d->translateModel,CB_ADDSTRING,0,(LPARAM)label.c_str());
+  if(item.file==keep&&select<0)select=(int)d->translateFiles.size()-1;
+ }
+ const auto installed=list_gguf_models();
+ for(const auto& file:installed){
+  bool known=false;
+  for(const auto& item:translate_catalog())if(item.file==file.name){known=true;break;}
+  if(known)continue;
+  d->translateFiles.push_back(file);
+  const std::wstring label=file.name+L"  ·  "+human_size(file.size)+L"  ·  本地";
+  SendMessageW(d->translateModel,CB_ADDSTRING,0,(LPARAM)label.c_str());
+  if(file.name==keep&&select<0)select=(int)d->translateFiles.size()-1;
+ }
+ if(select<0&&!d->translateFiles.empty())select=0;
+ SendMessageW(d->translateModel,CB_SETCURSEL,select,0);
+ logf(L"翻译模型列表刷新：已安装=%zu 清单=%zu 选中=%d",installed.size(),d->translateFiles.size(),select);
+}
+static void refresh_translate(CfgDlg*d){
+ if(!d||!d->translateStatus)return;
+ auto state=translate_download_state();
+ if(state.busy){
+  SetWindowTextW(d->translateStatus,state.text.c_str());
+  SetWindowTextW(d->translateDownload,L"取消下载");
+  EnableWindow(d->translateDownload,TRUE);
+  SendMessageW(d->translateProgress,PBM_SETPOS,state.percent,0);
+  return;
+ }
+ const std::wstring file=selected_translate_file(d);
+ bool known=false;
+ for(const auto& item:translate_catalog())if(item.file==file)known=true;
+ const unsigned long long size=disk_file_size(weights_dir()+L"\\"+file);
+ std::wstring text;
+ if(file.empty())text=L"models\\weights 中没有 GGUF 模型，可导入本地文件或下载。";
+ else if(size)text=L"已就绪："+file+L"（"+human_size(size)+L"）";
+ else if(known)text=L"未下载："+file+L"，点击下载按钮获取。";
+ else text=L"模型文件不存在："+file;
+ if(!state.text.empty()&&!size)text+=L"\n"+state.text;
+ SetWindowTextW(d->translateStatus,text.c_str());
+ SetWindowTextW(d->translateDownload,L"下载 / 校验模型");
+ EnableWindow(d->translateDownload,known?TRUE:FALSE);
+ SendMessageW(d->translateProgress,PBM_SETPOS,size?100:0,0);
 }
 #include "settings_layout.inc"
 static std::wstring hotkey_name(HWND h){
@@ -518,7 +581,7 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
   return ui::colors(msg,wp,lp);
  case WM_MEASUREITEM:if(lp){auto*m=(MEASUREITEMSTRUCT*)lp;if(m->CtlType==ODT_COMBOBOX){m->itemHeight=S(32);return TRUE;}}break;
  case WM_DRAWITEM:if(ui::draw_item((DRAWITEMSTRUCT*)lp))return TRUE;break;
- case WM_TIMER:if(d)refresh_download(d);return 0;
+ case WM_TIMER:if(d){refresh_download(d);refresh_translate(d);}return 0;
  case WM_HSCROLL:if(d)SetWindowTextW(d->qualityVal,std::to_wstring(SendMessageW(d->quality,TBM_GETPOS,0,0)).c_str());return 0;
  case WM_COMMAND:{
   if(!d)return 0;int id=LOWORD(wp);
@@ -532,7 +595,7 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    logf(L"识别主开关已即时关闭并卸载模型；保存后保留关闭状态，取消则恢复原开关但不预加载模型");
    return 0;
   }
-   if(id==109&&HIWORD(wp)==CBN_SELCHANGE){refresh_download(d);return 0;}
+   if((id==109||id==112)&&HIWORD(wp)==CBN_SELCHANGE){refresh_download(d);refresh_translate(d);return 0;}
   if(id==10){
    BROWSEINFOW bi{};bi.hwndOwner=h;bi.lpszTitle=L"选择截图保存目录";bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
    auto pidl=SHBrowseForFolderW(&bi);if(pidl){wchar_t path[MAX_PATH]{};if(SHGetPathFromIDListW(pidl,path))SetWindowTextW(d->saveDir,path);CoTaskMemFree(pidl);}return 0;
@@ -544,9 +607,56 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
     else ppocr_download_async();
     refresh_download(d);return 0;
    }
+   const bool fast=selected_ocr_engine(d)==1;
    if(hunyuan_download_state().busy)hunyuan_cancel_download();
-   else if(MessageBoxW(h,L"将从 Hugging Face 下载约 1.31 GB 模型并校验 SHA-256。\n已完整下载的文件仅校验，不重复下载。\n模型遵循腾讯混元社区许可（见随附 LICENSE-Hunyuan）。\n是否继续？",L"混元 OCR",MB_YESNO|MB_ICONINFORMATION)==IDYES)hunyuan_download_models_async();
+   else{
+    std::wstring message=L"将从 GitHub 模型发布页下载"+std::wstring(fast?L"混元轻量 Q3":L"混元高精度 Q8")+L"权重与共用运行时（约 "+human_size(hunyuan_download_size(fast))+L"）。\n已完整下载且校验通过的文件会跳过；下载支持断点续传和多线程。\n混元模型遵循腾讯混元社区许可。\n是否继续？";
+    if(MessageBoxW(h,message.c_str(),L"混元 OCR",MB_YESNO|MB_ICONINFORMATION)==IDYES)hunyuan_download_models_async(fast);
+   }
    refresh_download(d);return 0;
+  }
+  if(id==12){
+   wchar_t file[MAX_PATH*4]{};
+   OPENFILENAMEW ofn{};ofn.lStructSize=sizeof(ofn);ofn.hwndOwner=h;
+   ofn.lpstrFilter=L"GGUF 模型 (*.gguf)\0*.gguf\0所有文件\0*.*\0";
+   ofn.lpstrFile=file;ofn.nMaxFile=MAX_PATH*4;ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+   if(!GetOpenFileNameW(&ofn))return 0;
+   std::filesystem::path source(file);
+   if(_wcsicmp(source.extension().c_str(),L".gguf")){
+    MessageBoxW(h,L"请选择 .gguf 模型文件。",L"导入模型",MB_OK|MB_ICONWARNING);
+    return 0;
+   }
+   const std::wstring target=weights_dir()+L"\\"+source.filename().wstring();
+   std::error_code copyError;
+   if(std::filesystem::exists(target,copyError)&&
+      MessageBoxW(h,(L"模型已存在，是否覆盖？\n"+target).c_str(),L"导入模型",MB_YESNO|MB_ICONQUESTION)!=IDYES)return 0;
+   std::filesystem::copy_file(source,target,std::filesystem::copy_options::overwrite_existing,copyError);
+   if(copyError){
+    logf(L"导入翻译模型失败：来源=%s 目标=%s error=%d",source.wstring().c_str(),target.c_str(),copyError.value());
+    MessageBoxW(h,L"复制模型失败，请检查磁盘空间和写入权限。",L"导入模型",MB_OK|MB_ICONWARNING);
+    return 0;
+   }
+   logf(L"导入自定义翻译模型：来源=%s 目标=%s 大小=%s",source.wstring().c_str(),target.c_str(),human_size(disk_file_size(target)).c_str());
+   g_cfg.translate_model=source.filename().wstring();
+   rebuild_translate_models(d);
+   refresh_translate(d);
+   return 0;
+  }
+  if(id==13){
+   if(translate_download_state().busy){translate_cancel_download();refresh_translate(d);return 0;}
+   const std::wstring file=selected_translate_file(d);
+   const TranslateModelInfo* info=nullptr;
+   for(const auto& item:translate_catalog())if(item.file==file)info=&item;
+   if(!info){
+    MessageBoxW(h,L"自定义模型不支持在线下载，请把文件放到 models\\weights 后重新打开设置。",L"翻译模型",MB_OK|MB_ICONINFORMATION);
+    return 0;
+   }
+   std::wstring message=L"将下载 "+file+L"（"+human_size(info->size)+L"）";
+   if(!llama_runtime_ready())message+=L"和共用运行时（"+human_size(llama_runtime_size())+L"）";
+   message+=L"。\n下载支持断点续传和多线程，完成后校验 SHA-256，是否继续？";
+   if(MessageBoxW(h,message.c_str(),L"本地翻译模型",MB_YESNO|MB_ICONINFORMATION)==IDYES)translate_download_async(file);
+   refresh_translate(d);
+   return 0;
   }
   if(id!=1)return 0;
   LogTrace trace;
@@ -568,6 +678,7 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
   if(next.stroke_width<1||next.stroke_width>30||next.text_size<10||next.text_size>72){logf(L"保存设置被拒绝：标注参数无效 线宽=%d 字号=%d，未写入设置",next.stroke_width,next.text_size);MessageBoxW(h,L"线宽范围为 1–30，字号范围为 10–72。",L"标注设置",MB_OK);return 0;}
    next.auto_copy=checked(d->autoCopy);next.include_cursor=checked(d->includeCursor);next.ocr_enabled=checked(d->ocrEnabled);
    next.translate_enabled=checked(d->translateEnabled);
+   next.translate_model=selected_translate_file(d);
    int engineIndex=(int)SendMessageW(d->ocrEngine,CB_GETCURSEL,0,0);
    next.ocr_engine=engineIndex==2?L"ppocr":engineIndex==1?L"hunyuan_fast":L"hunyuan";
    int backendIndex=(int)SendMessageW(d->ocrBackend,CB_GETCURSEL,0,0);
@@ -578,7 +689,6 @@ static LRESULT CALLBACK cfg_proc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    logf(L"设置界面读取空闲回收选项：索引=%d 分钟=%d，保存成功后生效",idleIndex,next.ocr_idle_minutes);
   logf(L"功能设置：识别主开关=%d 翻译按钮=%d；组件在点击功能时检查",
        (int)next.ocr_enabled,(int)next.translate_enabled);
-  next.llm_base=text(d->base);next.llm_key=text(d->key);next.llm_model=text(d->model);
   if(next.hotkey_enabled&&!register_preferred(next.hotkey)){logf(L"保存设置被拒绝：快捷键被占用 hotkey=%s，未写入设置",next.hotkey.c_str());MessageBoxW(h,L"此快捷键已被占用，未保存更改。请选择另一个组合键。",L"快捷键冲突",MB_OK|MB_ICONWARNING);return 0;}
   if(!save_settings(next)){logf(L"保存设置返回：设置文件写入失败，恢复原快捷键，未应用更改");UnregisterHotKey(g_msgwnd,HOTKEY_ID);g_hotOk=false;if(g_cfg.hotkey_enabled)register_preferred(g_cfg.hotkey);MessageBoxW(h,L"设置文件写入失败，未应用。",L"保存失败",MB_OK);return 0;}
   g_cfg=next;
@@ -844,6 +954,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, LPWSTR, int) {
     if(wcsstr(GetCommandLineW(),L"--quit")){if(mutex)CloseHandle(mutex);Gdiplus::GdiplusShutdown(token);return 0;}
     init_dpi();
     g_cfg = load_settings();
+    migrate_legacy_models();
     ocr_set_enabled(g_cfg.ocr_enabled);
     ocr_set_idle_timeout(g_cfg.ocr_idle_minutes);
     logf(L"启动 %s，exe=%s", APP_VERSION, exe_path().c_str());
